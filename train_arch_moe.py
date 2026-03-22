@@ -1524,6 +1524,9 @@ def main() -> None:
 
         device = choose_device(args.device)
         print(f"Using device: {device}", flush=True)
+        n_gpus = torch.cuda.device_count() if device.startswith("cuda") else 0
+        if n_gpus > 1:
+            print(f"Using {n_gpus} GPUs with DataParallel.", flush=True)
         use_amp, use_tf32 = configure_runtime(device, args)
         print(f"Runtime options: amp={use_amp} tf32={use_tf32}", flush=True)
         scaler = create_grad_scaler(use_amp=use_amp, is_cuda=device.startswith("cuda"))
@@ -1601,6 +1604,9 @@ def main() -> None:
         )
 
         model = EncoderMoECTCModel(args, vocab_size=len(tokenizer.id_to_token)).to(device)
+        raw_model = model
+        if n_gpus > 1:
+            model = nn.DataParallel(model)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = build_lr_scheduler(optimizer, args, len(train_loader))
         ctc_loss = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True, reduction="mean")
@@ -1637,7 +1643,7 @@ def main() -> None:
 
             evolve_logs: list[dict[str, Any]] = []
             if should_run_expert_evolution(args, epoch):
-                evolve_logs = evolve_experts(model, valid_loader, ctc_loss, args, device, use_amp=use_amp)
+                evolve_logs = evolve_experts(raw_model, valid_loader, ctc_loss, args, device, use_amp=use_amp)
                 if evolve_logs:
                     save_json(output_dir / f"expert_evolution_epoch_{epoch}.json", {"events": evolve_logs})
 
@@ -1780,7 +1786,7 @@ def main() -> None:
                 no_improve_rounds = 0
                 torch.save(
                     {
-                        "model_state": model.state_dict(),
+                        "model_state": raw_model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
                         "config": vars(args),
@@ -1812,7 +1818,7 @@ def main() -> None:
 
         if test_loader is not None and (output_dir / "best.pt").exists():
             checkpoint = torch.load(output_dir / "best.pt", map_location=device)
-            model.load_state_dict(checkpoint["model_state"])
+            raw_model.load_state_dict(checkpoint["model_state"])
             test_metrics = evaluate(
                 model=model,
                 loader=test_loader,
