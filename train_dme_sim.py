@@ -5,6 +5,8 @@ import json
 import math
 import random
 import re
+import shutil
+import tempfile
 import time
 import wave
 from collections import defaultdict
@@ -38,6 +40,8 @@ except ImportError as exc:
     DataLoader = None
     Dataset = object
     TORCH_IMPORT_ERROR = exc
+
+from text_utils import normalize_transcript, split_graphemes
 
 
 def add_data_pipeline_args(parser: argparse.ArgumentParser) -> None:
@@ -95,6 +99,27 @@ def add_profiling_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_tokenizer_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tokenizer-type",
+        choices=("char", "grapheme", "sentencepiece"),
+        default="char",
+        help="Tokenizer used to encode transcripts.",
+    )
+    parser.add_argument(
+        "--sentencepiece-vocab-size",
+        type=int,
+        default=256,
+        help="SentencePiece vocabulary size when --tokenizer-type sentencepiece.",
+    )
+    parser.add_argument(
+        "--sentencepiece-character-coverage",
+        type=float,
+        default=1.0,
+        help="SentencePiece character coverage when --tokenizer-type sentencepiece.",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a compact ASR simulation with dense/token-MoE/SMEAR projector variants."
@@ -103,6 +128,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-manifest", required=True, help="Validation JSONL manifest.")
     parser.add_argument("--test-manifest", default=None, help="Optional test JSONL manifest.")
     parser.add_argument("--output-dir", required=True, help="Directory for checkpoints and metrics.")
+    parser.add_argument(
+        "--allow-existing-output-dir",
+        action="store_true",
+        help="Allow reusing a non-empty output directory. Disabled by default to avoid overwriting prior runs.",
+    )
     parser.add_argument(
         "--model-type",
         choices=("dense", "token_moe", "smear"),
@@ -127,9 +157,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch factor.")
     add_data_pipeline_args(parser)
+    add_tokenizer_args(parser)
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Gradient clip value.")
+    parser.add_argument(
+        "--spec-augment",
+        action="store_true",
+        help="Enable SpecAugment (time and frequency masking) during training.",
+    )
+    parser.add_argument("--freq-mask-param", type=int, default=27, help="Max frequency mask width for SpecAugment.")
+    parser.add_argument("--time-mask-param", type=int, default=100, help="Max time mask width for SpecAugment.")
+    parser.add_argument("--num-freq-masks", type=int, default=2, help="Number of frequency masks for SpecAugment.")
+    parser.add_argument("--num-time-masks", type=int, default=2, help="Number of time masks for SpecAugment.")
+    parser.add_argument(
+        "--scheduler",
+        choices=("none", "warmup_cosine"),
+        default="warmup_cosine",
+        help="Learning-rate scheduler.",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Warmup steps. Overrides --warmup-ratio when > 0.")
+    parser.add_argument("--warmup-ratio", type=float, default=0.05, help="Warmup ratio when --warmup-steps is 0.")
+    parser.add_argument("--min-lr-scale", type=float, default=0.1, help="Minimum LR scale for cosine scheduler.")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps.")
+    parser.add_argument(
+        "--decode-mode",
+        choices=("greedy", "beam"),
+        default="greedy",
+        help="Decoder used for validation/test metrics and checkpoint selection.",
+    )
+    parser.add_argument("--beam-width", type=int, default=1, help="Beam width for beam decoding. 1=greedy fallback.")
     parser.add_argument("--encoder-dim", type=int, default=256, help="Encoder hidden size.")
     parser.add_argument("--encoder-layers", type=int, default=3, help="BiGRU layers.")
     parser.add_argument("--projector-dim", type=int, default=256, help="Projector output size.")
@@ -139,7 +196,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hop-length", type=int, default=160, help="STFT hop length.")
     parser.add_argument("--win-length", type=int, default=400, help="STFT window length.")
     parser.add_argument("--n-mels", type=int, default=80, help="Number of mel bins.")
-    parser.add_argument("--max-audio-seconds", type=float, default=12.0, help="Max audio duration.")
+    parser.add_argument(
+        "--max-audio-seconds",
+        type=float,
+        default=0.0,
+        help="Max audio duration in seconds. 0 disables cropping.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--device",
@@ -184,6 +246,11 @@ def parse_args() -> argparse.Namespace:
         default="online",
         help="wandb mode.",
     )
+    parser.add_argument(
+        "--normalize-eval-text",
+        action="store_true",
+        help="Normalize reference and hypothesis text before computing CER/WER.",
+    )
     add_profiling_args(parser)
     return parser.parse_args()
 
@@ -219,6 +286,16 @@ def load_jsonl(path: str) -> list[dict]:
 def save_json(path: Path, payload: dict) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def prepare_output_dir(output_dir: Path, *, allow_existing: bool = False) -> Path:
+    if output_dir.exists() and any(output_dir.iterdir()) and not allow_existing:
+        raise FileExistsError(
+            f"Output directory is not empty: {output_dir}. "
+            "Pass --allow-existing-output-dir to overwrite an existing run directory."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
 
 def resolve_mode(mode: str, is_cuda: bool, default_on_cuda: bool = True) -> bool:
@@ -268,56 +345,226 @@ def resolve_training_tokenizer(
     *,
     args,
     train_manifest: str | None,
+    output_dir: str | Path | None = None,
 ) -> CharTokenizer:
     vocab_path = Path(args.vocab_json).resolve() if getattr(args, "vocab_json", None) else None
     if vocab_path is None:
         vocab_path = infer_vocab_path(train_manifest, getattr(args, "cache_dir", None))
     if vocab_path is not None and vocab_path.exists():
         return CharTokenizer.load(vocab_path)
-    return CharTokenizer.from_records(train_records)
+    return CharTokenizer.from_records(
+        train_records,
+        tokenizer_type=getattr(args, "tokenizer_type", "char"),
+        output_dir=output_dir,
+        sentencepiece_vocab_size=int(getattr(args, "sentencepiece_vocab_size", 256)),
+        sentencepiece_character_coverage=float(
+            getattr(args, "sentencepiece_character_coverage", 1.0)
+        ),
+    )
 
 
 class CharTokenizer:
-    def __init__(self, vocab: list[str]):
+    def __init__(
+        self,
+        vocab: list[str],
+        *,
+        tokenizer_type: str = "char",
+        sentencepiece_model_path: str | Path | None = None,
+    ):
+        self.tokenizer_type = str(tokenizer_type)
+        self.sentencepiece_model_path = (
+            Path(sentencepiece_model_path).resolve() if sentencepiece_model_path else None
+        )
+        self._sentencepiece = None
+        if self.tokenizer_type == "sentencepiece":
+            self._sentencepiece = self._load_sentencepiece_processor(self.sentencepiece_model_path)
         self.id_to_token = list(vocab)
         self.token_to_id = {token: idx for idx, token in enumerate(self.id_to_token)}
         self.blank_id = self.token_to_id["<blank>"]
         self.unk_id = self.token_to_id["<unk>"]
 
     @classmethod
-    def from_records(cls, records: list[dict]):
-        chars = sorted({char for item in records for char in item.get("text", "")})
-        return cls(["<blank>", "<unk>"] + chars)
+    def from_records(
+        cls,
+        records: list[dict],
+        *,
+        tokenizer_type: str = "char",
+        output_dir: str | Path | None = None,
+        sentencepiece_vocab_size: int = 256,
+        sentencepiece_character_coverage: float = 1.0,
+    ):
+        normalized_texts = [normalize_transcript(item.get("text", "")) for item in records]
+        if tokenizer_type == "sentencepiece":
+            if output_dir is None:
+                raise ValueError("output_dir is required to build a SentencePiece tokenizer.")
+            return cls._train_sentencepiece(
+                normalized_texts,
+                output_dir=output_dir,
+                vocab_size=sentencepiece_vocab_size,
+                character_coverage=sentencepiece_character_coverage,
+            )
+
+        if tokenizer_type == "grapheme":
+            units = sorted({unit for text in normalized_texts for unit in split_graphemes(text)})
+        else:
+            units = sorted({char for text in normalized_texts for char in text})
+        return cls(["<blank>", "<unk>"] + units, tokenizer_type=tokenizer_type)
 
     @classmethod
     def load(cls, path: str | Path):
         with Path(path).open("r", encoding="utf-8") as handle:
             vocab = json.load(handle)
-        if not isinstance(vocab, list):
-            raise ValueError(f"Vocabulary file must contain a JSON list: {path}")
-        return cls([str(token) for token in vocab])
+        if isinstance(vocab, list):
+            return cls([str(token) for token in vocab], tokenizer_type="char")
+        if not isinstance(vocab, dict):
+            raise ValueError(f"Vocabulary file must contain a JSON list or object: {path}")
+        tokens = vocab.get("vocab")
+        if not isinstance(tokens, list):
+            raise ValueError(f"Vocabulary payload must contain a 'vocab' list: {path}")
+        tokenizer_type = str(vocab.get("type", "char"))
+        sentencepiece_model = vocab.get("sentencepiece_model")
+        model_path = None
+        if sentencepiece_model:
+            model_path = (Path(path).resolve().parent / str(sentencepiece_model)).resolve()
+        return cls(
+            [str(token) for token in tokens],
+            tokenizer_type=tokenizer_type,
+            sentencepiece_model_path=model_path,
+        )
+
+    @staticmethod
+    def _load_sentencepiece_processor(model_path: str | Path | None):
+        if model_path is None:
+            raise ValueError("sentencepiece_model_path is required for a SentencePiece tokenizer.")
+        try:
+            import sentencepiece as spm
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'sentencepiece' package is required for sentencepiece tokenization. "
+                "Install dependencies with 'pip install -r requirements.txt'."
+            ) from exc
+        processor = spm.SentencePieceProcessor()
+        processor.load(str(model_path))
+        return processor
+
+    @classmethod
+    def _train_sentencepiece(
+        cls,
+        normalized_texts: list[str],
+        *,
+        output_dir: str | Path,
+        vocab_size: int,
+        character_coverage: float,
+    ) -> CharTokenizer:
+        try:
+            import sentencepiece as spm
+        except ImportError as exc:
+            raise RuntimeError(
+                "The 'sentencepiece' package is required for sentencepiece tokenization. "
+                "Install dependencies with 'pip install -r requirements.txt'."
+            ) from exc
+
+        output_path = Path(output_dir).resolve()
+        output_path.mkdir(parents=True, exist_ok=True)
+        model_prefix = output_path / "sentencepiece"
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".txt",
+            delete=False,
+            dir=output_path,
+        ) as handle:
+            for text in normalized_texts:
+                handle.write(text + "\n")
+            input_path = Path(handle.name)
+
+        try:
+            spm.SentencePieceTrainer.train(
+                input=str(input_path),
+                model_prefix=str(model_prefix),
+                vocab_size=max(32, int(vocab_size)),
+                model_type="unigram",
+                character_coverage=float(character_coverage),
+                bos_id=-1,
+                eos_id=-1,
+                pad_id=-1,
+                unk_id=0,
+                hard_vocab_limit=False,
+            )
+        finally:
+            input_path.unlink(missing_ok=True)
+
+        model_path = model_prefix.with_suffix(".model")
+        processor = cls._load_sentencepiece_processor(model_path)
+        vocab = ["<blank>"] + [
+            processor.id_to_piece(idx)
+            for idx in range(processor.get_piece_size())
+        ]
+        return cls(
+            vocab,
+            tokenizer_type="sentencepiece",
+            sentencepiece_model_path=model_path,
+        )
+
+    def _token_units(self, text: str) -> list[str]:
+        if self.tokenizer_type == "grapheme":
+            return split_graphemes(text)
+        return list(text)
 
     def encode(self, text: str) -> list[int]:
-        ids = [self.token_to_id.get(ch, self.unk_id) for ch in text]
+        normalized = normalize_transcript(text)
+        if self.tokenizer_type == "sentencepiece":
+            piece_ids = self._sentencepiece.encode(normalized, out_type=int)
+            ids = [piece_id + 1 for piece_id in piece_ids]
+        else:
+            ids = [self.token_to_id.get(unit, self.unk_id) for unit in self._token_units(normalized)]
         return ids if ids else [self.unk_id]
 
     def decode(self, token_ids: list[int]) -> str:
-        chars: list[str] = []
+        collapsed: list[int] = []
         prev = None
         for idx in token_ids:
             if idx == self.blank_id or idx == prev:
                 prev = idx
                 continue
-            if 0 <= idx < len(self.id_to_token):
-                token = self.id_to_token[idx]
-                if token not in {"<blank>", "<unk>"}:
-                    chars.append(token)
+            if idx == self.unk_id:
+                prev = idx
+                continue
+            collapsed.append(idx)
             prev = idx
-        return "".join(chars)
+        return self.decode_tokens(collapsed)
+
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        if self.tokenizer_type == "sentencepiece":
+            piece_ids = [idx - 1 for idx in token_ids if idx >= 1]
+            if not piece_ids:
+                return ""
+            return normalize_transcript(self._sentencepiece.decode_ids(piece_ids))
+        units = [
+            self.id_to_token[idx]
+            for idx in token_ids
+            if 0 <= idx < len(self.id_to_token) and self.id_to_token[idx] not in {"<blank>", "<unk>"}
+        ]
+        return "".join(units)
 
     def save(self, path: Path) -> None:
+        sentencepiece_model_name = None
+        if self.tokenizer_type == "sentencepiece" and self.sentencepiece_model_path is not None:
+            destination = path.resolve().parent / self.sentencepiece_model_path.name
+            if self.sentencepiece_model_path.resolve() != destination.resolve():
+                shutil.copy2(self.sentencepiece_model_path, destination)
+            sentencepiece_model_name = destination.name
         with path.open("w", encoding="utf-8") as handle:
-            json.dump(self.id_to_token, handle, ensure_ascii=False, indent=2)
+            json.dump(
+                {
+                    "type": self.tokenizer_type,
+                    "vocab": self.id_to_token,
+                    "sentencepiece_model": sentencepiece_model_name,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
 
 
 def edit_distance(ref: list[str], hyp: list[str]) -> int:
@@ -351,6 +598,29 @@ def compute_wer(reference: str, hypothesis: str) -> float:
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
     return edit_distance(ref_words, hyp_words) / len(ref_words)
+
+
+def compute_text_error_totals(reference: str, hypothesis: str) -> dict[str, int]:
+    ref_chars = list(reference)
+    hyp_chars = list(hypothesis)
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+    return {
+        "char_edits": edit_distance(ref_chars, hyp_chars),
+        "char_length": len(ref_chars),
+        "word_edits": edit_distance(ref_words, hyp_words),
+        "word_length": len(ref_words),
+    }
+
+
+def normalize_eval_text(text: str, args) -> str:
+    if getattr(args, "normalize_eval_text", False):
+        return normalize_transcript(text)
+    return text
+
+
+def estimate_subsampled_output_length(feature_length: int) -> int:
+    return ((int(feature_length) + 1) // 2 + 1) // 2
 
 
 def load_waveform(audio_path: str):
@@ -462,7 +732,35 @@ class LogMelExtractor:
         )
         power = spec.abs().pow(2.0)
         mel = torch.matmul(self.fbank, power)
-        return torch.log(mel + 1e-6).transpose(0, 1)
+        log_mel = torch.log(mel + 1e-6).transpose(0, 1)
+        log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-6)
+        return log_mel
+
+
+def spec_augment(
+    features: torch.Tensor,
+    freq_mask_param: int = 27,
+    time_mask_param: int = 100,
+    num_freq_masks: int = 2,
+    num_time_masks: int = 2,
+) -> torch.Tensor:
+    """Apply SpecAugment (time and frequency masking) to features (B, T, F)."""
+    augmented = features.clone()
+    _, max_time, freq_dim = augmented.shape
+
+    for _ in range(num_freq_masks):
+        f = random.randint(0, min(freq_mask_param, freq_dim - 1))
+        if f > 0:
+            f0 = random.randint(0, freq_dim - f)
+            augmented[:, :, f0:f0 + f] = 0.0
+
+    for _ in range(num_time_masks):
+        t = random.randint(0, min(time_mask_param, max_time - 1))
+        if t > 0:
+            t0 = random.randint(0, max_time - t)
+            augmented[:, t0:t0 + t, :] = 0.0
+
+    return augmented
 
 
 def prepare_feature_sample(
@@ -479,27 +777,40 @@ def prepare_feature_sample(
 
     domain = sample.get("domain", sample.get("simulation_domain", "clean"))
     waveform = apply_variant(waveform, domain)
-    if waveform.numel() > max_samples:
+    full_duration_seconds = float(waveform.numel() / expected_sample_rate)
+    was_cropped = False
+    if max_samples > 0 and waveform.numel() > max_samples:
         waveform = waveform[:max_samples]
+        was_cropped = True
 
     features = extractor(waveform).contiguous()
+    normalized_text = normalize_transcript(sample.get("text", ""))
     token_ids = sample.get("token_ids")
     if token_ids is None:
         if tokenizer is None:
             raise ValueError("tokenizer is required when sample does not already carry token_ids.")
-        token_ids = torch.tensor(tokenizer.encode(sample.get("text", "")), dtype=torch.long)
+        token_ids = torch.tensor(tokenizer.encode(normalized_text), dtype=torch.long)
     elif not isinstance(token_ids, torch.Tensor):
         token_ids = torch.tensor(token_ids, dtype=torch.long)
+
+    feature_length = int(features.size(0))
+    target_length = int(token_ids.numel())
 
     return {
         "id": sample["id"],
         "audio_filepath": sample["audio_filepath"],
-        "text": sample.get("text", ""),
+        "text": normalized_text,
         "domain": domain,
         "features": features,
-        "feature_length": int(features.size(0)),
+        "feature_length": feature_length,
         "token_ids": token_ids.to(dtype=torch.long).contiguous(),
-        "target_length": int(token_ids.numel()),
+        "target_length": target_length,
+        "source_duration_seconds": round(full_duration_seconds, 6),
+        "processed_duration_seconds": round(float(waveform.numel() / expected_sample_rate), 6),
+        "duration_seconds": round(float(waveform.numel() / expected_sample_rate), 6),
+        "was_cropped": was_cropped,
+        "estimated_dense_ctc_steps": feature_length,
+        "estimated_ctc_steps": estimate_subsampled_output_length(feature_length),
     }
 
 
@@ -509,7 +820,7 @@ class SpeechSimulationDataset(Dataset):
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
         for item in records:
-            text = item.get("text", "")
+            text = normalize_transcript(item.get("text", ""))
             token_ids = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
             self.records.append(
                 {
@@ -577,12 +888,20 @@ class CachedFeatureDataset(Dataset):
             token_ids = token_ids.to(device)
         return {
             "id": sample["id"],
-            "text": sample["text"],
+            "text": normalize_transcript(sample["text"]),
             "domain": sample["domain"],
             "features": features,
             "feature_length": int(sample["feature_length"]),
             "token_ids": token_ids,
             "target_length": int(sample["target_length"]),
+            "source_duration_seconds": float(sample.get("source_duration_seconds", 0.0)),
+            "processed_duration_seconds": float(sample.get("processed_duration_seconds", 0.0)),
+            "duration_seconds": float(sample.get("duration_seconds", 0.0)),
+            "was_cropped": bool(sample.get("was_cropped", False)),
+            "estimated_dense_ctc_steps": int(sample.get("estimated_dense_ctc_steps", sample["feature_length"])),
+            "estimated_ctc_steps": int(
+                sample.get("estimated_ctc_steps", estimate_subsampled_output_length(sample["feature_length"]))
+            ),
         }
 
     def _preload(self, device: str | None) -> None:
@@ -618,7 +937,7 @@ def build_raw_collate_fn(args, tokenizer: CharTokenizer):
         win_length=args.win_length,
         n_mels=args.n_mels,
     )
-    max_samples = int(args.max_audio_seconds * args.sample_rate)
+    max_samples = 0 if float(args.max_audio_seconds) <= 0 else int(args.max_audio_seconds * args.sample_rate)
 
     def collate_fn(batch: list[dict]) -> dict:
         features = []
@@ -938,6 +1257,87 @@ def decode_batch(log_probs, output_lengths, tokenizer: CharTokenizer) -> list[st
     return outputs
 
 
+def _log_add_exp(a: float, b: float) -> float:
+    if a == float("-inf"):
+        return b
+    if b == float("-inf"):
+        return a
+    if a < b:
+        a, b = b, a
+    return a + math.log1p(math.exp(b - a))
+
+
+def beam_search_decode(
+    log_probs: torch.Tensor,
+    output_lengths: torch.Tensor,
+    tokenizer: CharTokenizer,
+    beam_width: int = 10,
+) -> list[str]:
+    """CTC prefix beam search in log-space."""
+    if beam_width <= 1:
+        return decode_batch(log_probs, output_lengths, tokenizer)
+
+    blank_id = tokenizer.blank_id
+    results: list[str] = []
+
+    for i in range(log_probs.size(0)):
+        T = int(output_lengths[i].item())
+        frame_log_probs = log_probs[i, :T].cpu()
+
+        beams: dict[tuple[int, ...], list[float]] = {(): [0.0, float("-inf")]}
+
+        for t in range(T):
+            frame = frame_log_probs[t]
+            top_k = min(beam_width + 1, frame.size(0))
+            topk_log_probs, topk_ids = frame.topk(top_k)
+            blank_log_prob = float(frame[blank_id].item())
+
+            new_beams: dict[tuple[int, ...], list[float]] = defaultdict(
+                lambda: [float("-inf"), float("-inf")]
+            )
+
+            for prefix, (pb, pnb) in beams.items():
+                p_total = _log_add_exp(pb, pnb)
+                new_beams[prefix][0] = _log_add_exp(new_beams[prefix][0], p_total + blank_log_prob)
+
+                for k in range(top_k):
+                    c = int(topk_ids[k].item())
+                    if c == blank_id:
+                        continue
+                    token_log_prob = float(topk_log_probs[k].item())
+                    if prefix and prefix[-1] == c:
+                        new_beams[prefix][1] = _log_add_exp(new_beams[prefix][1], pnb + token_log_prob)
+                        ext = prefix + (c,)
+                        new_beams[ext][1] = _log_add_exp(new_beams[ext][1], pb + token_log_prob)
+                    else:
+                        ext = prefix + (c,)
+                        new_beams[ext][1] = _log_add_exp(new_beams[ext][1], p_total + token_log_prob)
+
+            sorted_beams = sorted(
+                new_beams.items(),
+                key=lambda x: _log_add_exp(x[1][0], x[1][1]),
+                reverse=True,
+            )[:beam_width]
+            beams = {bk: bv for bk, bv in sorted_beams}
+
+        best_prefix = max(beams, key=lambda bk: _log_add_exp(beams[bk][0], beams[bk][1]))
+        results.append(tokenizer.decode_tokens(list(best_prefix)))
+
+    return results
+
+
+def select_hypotheses(log_probs, output_lengths, tokenizer: CharTokenizer, args) -> list[str]:
+    decode_mode = str(getattr(args, "decode_mode", "greedy"))
+    if decode_mode == "beam":
+        return beam_search_decode(
+            log_probs,
+            output_lengths,
+            tokenizer,
+            beam_width=max(1, int(getattr(args, "beam_width", 1))),
+        )
+    return decode_batch(log_probs, output_lengths, tokenizer)
+
+
 def summarize_routing(storage: dict[str, list[torch.Tensor]]) -> dict[str, list[float]]:
     summary: dict[str, list[float]] = {}
     for domain, values in storage.items():
@@ -1002,6 +1402,29 @@ def build_progress(iterable, *, total: int, desc: str, leave: bool):
     return tqdm(iterable, total=total, desc=desc, leave=leave, dynamic_ncols=True)
 
 
+def build_lr_scheduler(optimizer, args, steps_per_epoch: int):
+    scheduler_type = getattr(args, "scheduler", "none")
+    if scheduler_type == "none":
+        return None
+    total_steps = max(1, int(args.epochs) * max(1, steps_per_epoch))
+    warmup_steps = int(getattr(args, "warmup_steps", 0))
+    if warmup_steps <= 0:
+        warmup_steps = int(round(total_steps * float(getattr(args, "warmup_ratio", 0.05))))
+    warmup_steps = min(max(0, warmup_steps), max(0, total_steps - 1))
+    min_lr_scale = float(getattr(args, "min_lr_scale", 0.1))
+
+    def lr_lambda(current_step: int) -> float:
+        step = current_step + 1
+        if warmup_steps > 0 and step <= warmup_steps:
+            return max(1e-8, step / warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
 def evaluate(
     model,
     loader,
@@ -1014,8 +1437,12 @@ def evaluate(
 ) -> dict:
     model.eval()
     total_loss = 0.0
-    total_cer = 0.0
-    total_wer = 0.0
+    total_mean_cer = 0.0
+    total_mean_wer = 0.0
+    total_char_edits = 0
+    total_char_length = 0
+    total_word_edits = 0
+    total_word_length = 0
     samples = 0
     routing_by_domain: dict[str, list[torch.Tensor]] = defaultdict(list)
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
@@ -1041,10 +1468,17 @@ def evaluate(
                     )
             total_loss += loss.item()
 
-            hypotheses = decode_batch(log_probs, output_lengths, tokenizer)
+            hypotheses = select_hypotheses(log_probs, output_lengths, tokenizer, args)
             for idx, (ref, hyp) in enumerate(zip(batch["texts"], hypotheses)):
-                total_cer += compute_cer(ref, hyp)
-                total_wer += compute_wer(ref, hyp)
+                normalized_ref = normalize_eval_text(ref, args)
+                normalized_hyp = normalize_eval_text(hyp, args)
+                total_mean_cer += compute_cer(normalized_ref, normalized_hyp)
+                total_mean_wer += compute_wer(normalized_ref, normalized_hyp)
+                error_totals = compute_text_error_totals(normalized_ref, normalized_hyp)
+                total_char_edits += error_totals["char_edits"]
+                total_char_length += error_totals["char_length"]
+                total_word_edits += error_totals["word_edits"]
+                total_word_length += error_totals["word_length"]
                 if routing is not None:
                     routing_by_domain[batch["domains"][idx]].append(routing[idx].detach().cpu())
                 samples += 1
@@ -1052,13 +1486,19 @@ def evaluate(
             if tqdm is not None:
                 iterator.set_postfix(
                     loss=f"{total_loss / max(1, step):.4f}",
-                    cer=f"{total_cer / max(1, samples):.4f}",
+                    cer=f"{total_mean_cer / max(1, samples):.4f}",
                 )
 
+    corpus_cer = total_char_edits / max(1, total_char_length)
+    corpus_wer = total_word_edits / max(1, total_word_length)
     return {
         "loss": total_loss / max(1, len(loader)),
-        "cer": total_cer / max(1, samples),
-        "wer": total_wer / max(1, samples),
+        "cer": corpus_cer,
+        "wer": corpus_wer,
+        "mean_cer": total_mean_cer / max(1, samples),
+        "mean_wer": total_mean_wer / max(1, samples),
+        "corpus_cer": corpus_cer,
+        "corpus_wer": corpus_wer,
         "routing": summarize_routing(routing_by_domain),
     }
 
@@ -1075,10 +1515,12 @@ def train_one_epoch(
     wandb_run=None,
     scaler=None,
     use_amp: bool = False,
+    scheduler=None,
 ):
     del tokenizer
     model.train()
     running_loss = 0.0
+    accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
     autocast_dtype = torch.float16 if autocast_device == "cuda" else torch.bfloat16
     iterator = build_progress(loader, total=len(loader), desc=f"train e{epoch}", leave=False)
@@ -1099,7 +1541,18 @@ def train_one_epoch(
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
         synchronize_for_timing(device, profile_enabled)
         timing_sums["transfer"] += time.perf_counter() - transfer_start
-        optimizer.zero_grad(set_to_none=True)
+
+        if (step - 1) % accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
+
+        if getattr(args, "spec_augment", False):
+            batch["inputs"] = spec_augment(
+                batch["inputs"],
+                freq_mask_param=int(getattr(args, "freq_mask_param", 27)),
+                time_mask_param=int(getattr(args, "time_mask_param", 100)),
+                num_freq_masks=int(getattr(args, "num_freq_masks", 2)),
+                num_time_masks=int(getattr(args, "num_time_masks", 2)),
+            )
 
         forward_start = time.perf_counter()
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
@@ -1117,23 +1570,27 @@ def train_one_epoch(
         synchronize_for_timing(device, profile_enabled)
         timing_sums["forward"] += time.perf_counter() - forward_start
 
+        scaled_loss = loss / accum_steps
         backward_start = time.perf_counter()
         if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
+            scaled_loss.backward()
         synchronize_for_timing(device, profile_enabled)
         timing_sums["backward"] += time.perf_counter() - backward_start
 
         optimizer_start = time.perf_counter()
-        if scaler is not None and scaler.is_enabled():
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+        if step % accum_steps == 0 or step == len(loader):
+            if scaler is not None and scaler.is_enabled():
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
         synchronize_for_timing(device, profile_enabled)
         timing_sums["optimizer"] += time.perf_counter() - optimizer_start
 
@@ -1193,8 +1650,10 @@ def main() -> None:
     ensure_torch()
     set_seed(args.seed)
 
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = prepare_output_dir(
+        Path(args.output_dir).resolve(),
+        allow_existing=bool(getattr(args, "allow_existing_output_dir", False)),
+    )
     save_json(output_dir / "config.json", vars(args))
     wandb_run = init_wandb_run(args, output_dir, vars(args))
 
@@ -1207,6 +1666,7 @@ def main() -> None:
             train_records,
             args=args,
             train_manifest=args.train_manifest,
+            output_dir=output_dir,
         )
         tokenizer.save(output_dir / "vocab.json")
 
@@ -1290,7 +1750,15 @@ def main() -> None:
 
         model = AcousticCTCModel(args, vocab_size=len(tokenizer.id_to_token)).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = build_lr_scheduler(optimizer, args, len(train_loader))
         ctc_loss = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
+        if scheduler is not None:
+            print(
+                f"Scheduler: {args.scheduler} warmup_steps="
+                f"{int(args.warmup_steps) if args.warmup_steps > 0 else int(round(args.warmup_ratio * args.epochs * len(train_loader)))} "
+                f"min_lr_scale={args.min_lr_scale}",
+                flush=True,
+            )
 
         best_valid_cer = float("inf")
         no_improve_rounds = 0
@@ -1311,6 +1779,7 @@ def main() -> None:
                 wandb_run=wandb_run,
                 scaler=scaler,
                 use_amp=use_amp,
+                scheduler=scheduler,
             )
             should_eval = (epoch % eval_every == 0) or (epoch == args.epochs)
             if not should_eval:
@@ -1351,12 +1820,17 @@ def main() -> None:
                 "valid_loss": round(valid_metrics["loss"], 6),
                 "valid_cer": round(valid_metrics["cer"], 6),
                 "valid_wer": round(valid_metrics["wer"], 6),
+                "valid_mean_cer": round(valid_metrics["mean_cer"], 6),
+                "valid_mean_wer": round(valid_metrics["mean_wer"], 6),
+                "valid_corpus_cer": round(valid_metrics["corpus_cer"], 6),
+                "valid_corpus_wer": round(valid_metrics["corpus_wer"], 6),
                 "valid_routing": valid_metrics["routing"],
             }
             history.append(epoch_metrics)
             print(
                 f"epoch={epoch} valid_loss={valid_metrics['loss']:.4f} "
-                f"valid_cer={valid_metrics['cer']:.4f} valid_wer={valid_metrics['wer']:.4f}",
+                f"valid_cer={valid_metrics['cer']:.4f} valid_wer={valid_metrics['wer']:.4f} "
+                f"mean_cer={valid_metrics['mean_cer']:.4f} mean_wer={valid_metrics['mean_wer']:.4f}",
                 flush=True,
             )
 
@@ -1371,6 +1845,10 @@ def main() -> None:
                     "valid/loss": valid_metrics["loss"],
                     "valid/cer": valid_metrics["cer"],
                     "valid/wer": valid_metrics["wer"],
+                    "valid/mean_cer": valid_metrics["mean_cer"],
+                    "valid/mean_wer": valid_metrics["mean_wer"],
+                    "valid/corpus_cer": valid_metrics["corpus_cer"],
+                    "valid/corpus_wer": valid_metrics["corpus_wer"],
                     "valid/is_best": int(is_best),
                     **flatten_routing_metrics("valid", valid_metrics["routing"]),
                 },
@@ -1425,7 +1903,8 @@ def main() -> None:
             save_json(output_dir / "test_metrics.json", test_metrics)
             print(
                 f"test_loss={test_metrics['loss']:.4f} test_cer={test_metrics['cer']:.4f} "
-                f"test_wer={test_metrics['wer']:.4f}",
+                f"test_wer={test_metrics['wer']:.4f} "
+                f"mean_cer={test_metrics['mean_cer']:.4f} mean_wer={test_metrics['mean_wer']:.4f}",
                 flush=True,
             )
             log_wandb_metrics(
@@ -1436,6 +1915,10 @@ def main() -> None:
                     "test/loss": test_metrics["loss"],
                     "test/cer": test_metrics["cer"],
                     "test/wer": test_metrics["wer"],
+                    "test/mean_cer": test_metrics["mean_cer"],
+                    "test/mean_wer": test_metrics["mean_wer"],
+                    "test/corpus_cer": test_metrics["corpus_cer"],
+                    "test/corpus_wer": test_metrics["corpus_wer"],
                     **flatten_routing_metrics("test", test_metrics["routing"]),
                 },
             )

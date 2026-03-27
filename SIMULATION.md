@@ -21,13 +21,13 @@ pip install -r ./requirements.txt
 ### 2.1 SPRINGLab/IndicTTS-Hindi
 
 ```bash
-python ./process_data.py \
-  --dataset SPRINGLab/IndicTTS-Hindi \
-  --output-dir ./processed_data_indic \
-  --val-size 0.1 \
-  --test-size 0.1 \
-  --sample-rate 22050 \
-  --default-language hi
+python ./process_data.py `
+  --dataset SPRINGLab/IndicTTS_Telugu `
+  --output-dir ./processed_data_indic `
+  --val-size 0.1 `
+  --test-size 0.1 `
+  --sample-rate 22050 `
+  --default-language telugu
 ```
 
 ### 2.2 dianavdavidson/MUCS-Hinglish
@@ -51,11 +51,11 @@ Notes:
 ### 3.1 Indic
 
 ```bash
-python ./prepare_simulation_manifests.py \
-  --input-dir ./processed_data_indic/manifests \
-  --output-dir ./simulation_manifests_indic \
-  --train-variants clean,speed_0.9,speed_1.1,noise_0.005 \
-  --eval-variants clean \
+python ./prepare_simulation_manifests.py `
+  --input-dir ./processed_data_indic/manifests `
+  --output-dir ./simulation_manifests_indic `
+  --train-variants clean,speed_0.9,speed_1.1,noise_0.005 `
+  --eval-variants clean `
   --language-tag auto
 ```
 
@@ -112,18 +112,18 @@ Each cache directory contains:
 ### 5.1 Cache Indic
 
 ```bash
-python ./precompute_features.py \
-  --manifest ./simulation_manifests_indic/train.jsonl \
+python ./precompute_features.py `
+  --manifest ./simulation_manifests_indic/train.jsonl `
   --output-dir ./cache_indic/train
 
-python ./precompute_features.py \
-  --manifest ./simulation_manifests_indic/validation.jsonl \
-  --output-dir ./cache_indic/validation \
+python ./precompute_features.py `
+  --manifest ./simulation_manifests_indic/validation.jsonl `
+  --output-dir ./cache_indic/validation `
   --vocab-json ./cache_indic/train/vocab.json
 
-python ./precompute_features.py \
-  --manifest ./simulation_manifests_indic/test.jsonl \
-  --output-dir ./cache_indic/test \
+python ./precompute_features.py `
+  --manifest ./simulation_manifests_indic/test.jsonl `
+  --output-dir ./cache_indic/test `
   --vocab-json ./cache_indic/train/vocab.json
 ```
 
@@ -173,31 +173,32 @@ Notes:
 Example with Indic cache:
 
 ```bash
-python ./train_arch_moe.py \
-  --train-manifest ./cache_indic/train/manifest.jsonl \
-  --valid-manifest ./cache_indic/validation/manifest.jsonl \
-  --test-manifest ./cache_indic/test/manifest.jsonl \
-  --output-dir ./runs/ca_samoe_indic_cached \
-  --data-mode cached \
-  --encoder-type conformer \
-  --ffn-type shared_adapter_moe \
-  --num-experts 4 \
-  --epochs 20 \
-  --batch-size 32 \
-  --num-workers 4 \
-  --pin-memory on \
-  --persistent-workers on \
-  --prefetch-factor 4 \
-  --competition-weight 0.05 \
-  --competition-interval-steps 4 \
-  --competition-warmup-epochs 1 \
-  --competition-batches 1 \
-  --eval-every-epochs 1 \
-  --early-stop-patience 5 \
-  --amp on \
-  --profile-performance \
-  --log-timing-every 20 \
-  --wandb-run-name arch-casamoe-indic
+python ./train_arch_moe.py `
+  --train-manifest ./cache_indic/train/manifest.jsonl `
+  --valid-manifest ./cache_indic/validation/manifest.jsonl `
+  --test-manifest ./cache_indic/test/manifest.jsonl `
+  --output-dir ./runs/ca_samoe_indic_cached `
+  --data-mode cached `
+  --encoder-type conformer `
+  --ffn-type shared_adapter_moe `
+  --num-experts 6 `
+  --epochs 50 `
+  --batch-size 12 `
+  --num-workers 4 `
+  --pin-memory on `
+  --persistent-workers on `
+  --prefetch-factor 4 `
+  --competition-weight 0.05 `
+  --competition-interval-steps 4 `
+  --competition-warmup-epochs 1 `
+  --competition-batches 1 `
+  --eval-every-epochs 1 `
+  --early-stop-patience 5 `
+  --amp on `
+  --profile-performance `
+  --log-timing-every 20 `
+  --max-audio-seconds 30 `
+  --wandb-run-name arch-casamoe-indic_telugu
 ```
 
 Example with merged cache:

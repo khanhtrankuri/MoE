@@ -1,5 +1,7 @@
 datasets
 numpy
+regex
+sentencepiece
 torch
 tqdm
 wandb

@@ -24,15 +24,16 @@ from train_dme_sim import (
     CharTokenizer,
     add_data_pipeline_args,
     add_profiling_args,
+    add_tokenizer_args,
     build_collate_fn,
     build_dataset_for_mode,
     build_progress,
     choose_device,
     compute_cer,
+    compute_text_error_totals,
     compute_wer,
     configure_runtime,
     create_grad_scaler,
-    decode_batch,
     dataset_storage_device,
     ensure_torch,
     finish_wandb_run,
@@ -43,10 +44,14 @@ from train_dme_sim import (
     load_jsonl,
     log_wandb_metrics,
     move_batch_to_device,
+    normalize_eval_text,
+    prepare_output_dir,
     resolve_loader_kwargs,
     resolve_training_tokenizer,
     save_json,
+    select_hypotheses,
     set_seed,
+    spec_augment,
     summarize_routing,
     synchronize_for_timing,
 )
@@ -60,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-manifest", required=True, help="Validation JSONL manifest.")
     parser.add_argument("--test-manifest", default=None, help="Optional test JSONL manifest.")
     parser.add_argument("--output-dir", required=True, help="Directory for checkpoints and metrics.")
+    parser.add_argument(
+        "--allow-existing-output-dir",
+        action="store_true",
+        help="Allow reusing a non-empty output directory. Disabled by default to avoid overwriting prior runs.",
+    )
     parser.add_argument(
         "--encoder-type",
         choices=("transformer", "conformer"),
@@ -169,10 +179,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of early MoE blocks to evolve. <= 0 means evolve all MoE blocks.",
     )
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch factor.")
     add_data_pipeline_args(parser)
+    add_tokenizer_args(parser)
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate.")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument(
@@ -200,6 +211,48 @@ def parse_args() -> argparse.Namespace:
         help="Minimum LR scale reached by the cosine scheduler.",
     )
     parser.add_argument("--grad-clip", type=float, default=5.0, help="Gradient clipping value.")
+    parser.add_argument(
+        "--entropy-bonus-weight",
+        type=float,
+        default=0.0,
+        help="Weight for routing entropy bonus loss (encourages diverse expert usage). Recommended: 0.01-0.05.",
+    )
+    parser.add_argument(
+        "--temperature-anneal-start",
+        type=float,
+        default=None,
+        help="Initial router temperature for annealing schedule. Defaults to --router-temperature.",
+    )
+    parser.add_argument(
+        "--temperature-anneal-end",
+        type=float,
+        default=None,
+        help="Final router temperature at end of annealing. Defaults to --router-temperature.",
+    )
+    parser.add_argument(
+        "--temperature-anneal-epochs",
+        type=int,
+        default=0,
+        help="Number of epochs over which to linearly anneal router temperature. 0=disabled.",
+    )
+    parser.add_argument(
+        "--spec-augment",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable SpecAugment during training. Use --no-spec-augment to disable.",
+    )
+    parser.add_argument("--freq-mask-param", type=int, default=27, help="Max frequency mask width for SpecAugment.")
+    parser.add_argument("--time-mask-param", type=int, default=100, help="Max time mask width for SpecAugment.")
+    parser.add_argument("--num-freq-masks", type=int, default=2, help="Number of frequency masks for SpecAugment.")
+    parser.add_argument("--num-time-masks", type=int, default=2, help="Number of time masks for SpecAugment.")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps.")
+    parser.add_argument(
+        "--decode-mode",
+        choices=("greedy", "beam"),
+        default="greedy",
+        help="Decoder used for validation/test metrics and checkpoint selection.",
+    )
+    parser.add_argument("--beam-width", type=int, default=1, help="Beam width for beam decoding. 1=greedy fallback.")
     parser.add_argument("--encoder-dim", type=int, default=256, help="Model dimension.")
     parser.add_argument("--encoder-layers", type=int, default=6, help="Number of encoder layers.")
     parser.add_argument("--num-heads", type=int, default=4, help="Attention heads.")
@@ -233,7 +286,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hop-length", type=int, default=160, help="Hop length for STFT.")
     parser.add_argument("--win-length", type=int, default=400, help="Window length for STFT.")
     parser.add_argument("--n-mels", type=int, default=80, help="Number of mel bins.")
-    parser.add_argument("--max-audio-seconds", type=float, default=12.0, help="Crop longer audio.")
+    parser.add_argument(
+        "--max-audio-seconds",
+        type=float,
+        default=0.0,
+        help="Crop longer audio. 0 disables cropping.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--device",
@@ -278,6 +336,36 @@ def parse_args() -> argparse.Namespace:
         default="online",
         help="Weights & Biases mode when logging is enabled.",
     )
+    parser.add_argument(
+        "--normalize-eval-text",
+        action="store_true",
+        help="Normalize reference and hypothesis text before computing CER/WER.",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.1,
+        help="Label smoothing weight. Mixes CTC loss with uniform-distribution entropy regularizer. 0 disables.",
+    )
+    parser.add_argument(
+        "--layer-drop",
+        type=float,
+        default=0.1,
+        help="Probability of dropping each encoder layer during training (stochastic depth). 0 disables.",
+    )
+    parser.add_argument(
+        "--intermediate-ctc-weight",
+        type=float,
+        default=0.3,
+        help="Weight for intermediate CTC loss at a middle encoder layer. 0 disables.",
+    )
+    parser.add_argument(
+        "--intermediate-ctc-layer",
+        type=int,
+        default=0,
+        help="Encoder layer index for intermediate CTC loss. 0 = auto (middle layer).",
+    )
+    parser.set_defaults(tokenizer_type="grapheme")
     add_profiling_args(parser)
     return parser.parse_args()
 
@@ -324,6 +412,117 @@ if TORCH_IMPORT_ERROR is None:
             hidden = hidden.transpose(1, 2).contiguous().view(batch_size, time_steps, channels * freq_bins)
             hidden = self.out(hidden)
             return hidden, self.output_lengths(input_lengths)
+
+
+    class RelativePositionalEncoding(nn.Module):
+        """Sinusoidal relative positional encoding for Conformer/Transformer with relative attention."""
+
+        def __init__(self, model_dim: int, max_len: int = 5000, dropout: float = 0.1):
+            super().__init__()
+            self.model_dim = model_dim
+            self.dropout = nn.Dropout(dropout)
+            pe = torch.zeros(max_len, model_dim)
+            positions = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, model_dim, 2, dtype=torch.float32)
+                * (-math.log(10000.0) / model_dim)
+            )
+            pe[:, 0::2] = torch.sin(positions * div_term)
+            pe[:, 1::2] = torch.cos(positions * div_term)
+            self.register_buffer("pe", pe, persistent=False)
+
+        def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """Return (hidden_states, pos_enc) where pos_enc is (1, 2T-1, D).
+
+            Position encodings are ordered [p_{T-1}, ..., p_0, p_{-1}, ..., p_{-(T-1)}]
+            so that the rel_shift operation in RelativeMultiHeadAttention produces
+            the correct relative-distance scores.
+            """
+            T = hidden_states.size(1)
+            pe_pos = self.pe[:T]
+            pe_neg = self.pe[1:T].clone()
+            pe_neg[:, 0::2] = -pe_neg[:, 0::2]
+            pe_positive_reversed = torch.flip(pe_pos, [0])
+            pos_enc = torch.cat([pe_positive_reversed, pe_neg], dim=0).unsqueeze(0)
+            return self.dropout(hidden_states), self.dropout(pos_enc)
+
+
+    class RelativeMultiHeadAttention(nn.Module):
+        """Multi-head attention with relative positional encoding (Transformer-XL / Conformer style)."""
+
+        def __init__(self, model_dim: int, num_heads: int, dropout: float):
+            super().__init__()
+            assert model_dim % num_heads == 0
+            self.num_heads = num_heads
+            self.head_dim = model_dim // num_heads
+            self.model_dim = model_dim
+            self.scale = self.head_dim ** -0.5
+
+            self.w_q = nn.Linear(model_dim, model_dim)
+            self.w_k = nn.Linear(model_dim, model_dim)
+            self.w_v = nn.Linear(model_dim, model_dim)
+            self.w_pos = nn.Linear(model_dim, model_dim, bias=False)
+            self.w_out = nn.Linear(model_dim, model_dim)
+
+            self.pos_bias_u = nn.Parameter(torch.Tensor(num_heads, self.head_dim))
+            self.pos_bias_v = nn.Parameter(torch.Tensor(num_heads, self.head_dim))
+            nn.init.xavier_uniform_(self.pos_bias_u.unsqueeze(0))
+            nn.init.xavier_uniform_(self.pos_bias_v.unsqueeze(0))
+
+            self.attn_dropout = nn.Dropout(dropout)
+
+        @staticmethod
+        def _rel_shift(x: torch.Tensor) -> torch.Tensor:
+            """Convert absolute position scores to relative position scores.
+
+            Input  (B, H, T, 2T-1) -> Output (B, H, T, T)
+            """
+            B, H, T, L = x.shape
+            x = F.pad(x, (1, 0))
+            x = x.contiguous().view(B, H, L + 1, T)
+            x = x[:, :, 1:].contiguous().view(B, H, T, L)
+            return x[:, :, :, :T]
+
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            pos_enc: torch.Tensor,
+            key_padding_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """
+            Args:
+                query, key, value: (B, T, D)
+                pos_enc: (1, 2T-1, D) relative position encodings
+                key_padding_mask: (B, T) True = position to ignore
+            """
+            B, T, _ = query.shape
+
+            q = self.w_q(query).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.w_k(key).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.w_v(value).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+
+            p = self.w_pos(pos_enc).view(-1, pos_enc.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+
+            q_u = q + self.pos_bias_u[None, :, None, :]
+            content_score = torch.matmul(q_u, k.transpose(-2, -1))
+
+            q_v = q + self.pos_bias_v[None, :, None, :]
+            pos_score = torch.matmul(q_v, p.transpose(-2, -1))
+            pos_score = self._rel_shift(pos_score)
+
+            scores = (content_score + pos_score) * self.scale
+
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+
+            attn = torch.softmax(scores, dim=-1)
+            attn = self.attn_dropout(attn)
+
+            output = torch.matmul(attn, v)
+            output = output.transpose(1, 2).contiguous().view(B, T, self.model_dim)
+            return self.w_out(output)
 
 
     class DenseFFN(nn.Module):
@@ -529,12 +728,12 @@ if TORCH_IMPORT_ERROR is None:
     class TransformerMoEBlock(nn.Module):
         def __init__(self, args: argparse.Namespace):
             super().__init__()
+            self.layer_drop = float(getattr(args, "layer_drop", 0.0))
             self.self_attn_norm = nn.LayerNorm(args.encoder_dim)
-            self.self_attn = nn.MultiheadAttention(
-                embed_dim=args.encoder_dim,
+            self.self_attn = RelativeMultiHeadAttention(
+                model_dim=args.encoder_dim,
                 num_heads=args.num_heads,
                 dropout=args.dropout,
-                batch_first=True,
             )
             self.dropout = nn.Dropout(args.dropout)
             self.ffn_norm = nn.LayerNorm(args.encoder_dim)
@@ -554,17 +753,18 @@ if TORCH_IMPORT_ERROR is None:
             self,
             hidden_states: torch.Tensor,
             mask: torch.Tensor,
+            pos_enc: torch.Tensor,
             forced_expert: int | None = None,
             return_all_experts: bool = False,
         ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any] | None]:
+            if self.training and self.layer_drop > 0 and random.random() < self.layer_drop:
+                return hidden_states, None, None
             key_padding_mask = ~mask.bool()
             attn_input = self.self_attn_norm(hidden_states)
-            attn_output, _ = self.self_attn(
-                attn_input,
-                attn_input,
-                attn_input,
+            attn_output = self.self_attn(
+                attn_input, attn_input, attn_input,
+                pos_enc=pos_enc,
                 key_padding_mask=key_padding_mask,
-                need_weights=False,
             )
             hidden_states = hidden_states + self.dropout(attn_output)
             ffn_output, routing, aux = self.ffn(
@@ -580,14 +780,14 @@ if TORCH_IMPORT_ERROR is None:
     class ConformerMoEBlock(nn.Module):
         def __init__(self, args: argparse.Namespace):
             super().__init__()
+            self.layer_drop = float(getattr(args, "layer_drop", 0.0))
             self.macaron_norm = nn.LayerNorm(args.encoder_dim)
             self.macaron_ffn = DenseFFN(args.encoder_dim, args.ffn_hidden_dim, args.dropout)
             self.self_attn_norm = nn.LayerNorm(args.encoder_dim)
-            self.self_attn = nn.MultiheadAttention(
-                embed_dim=args.encoder_dim,
+            self.self_attn = RelativeMultiHeadAttention(
+                model_dim=args.encoder_dim,
                 num_heads=args.num_heads,
                 dropout=args.dropout,
-                batch_first=True,
             )
             self.conv_module = ConformerConvModule(
                 model_dim=args.encoder_dim,
@@ -613,20 +813,21 @@ if TORCH_IMPORT_ERROR is None:
             self,
             hidden_states: torch.Tensor,
             mask: torch.Tensor,
+            pos_enc: torch.Tensor,
             forced_expert: int | None = None,
             return_all_experts: bool = False,
         ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, Any] | None]:
+            if self.training and self.layer_drop > 0 and random.random() < self.layer_drop:
+                return hidden_states, None, None
             macaron_out, _, _ = self.macaron_ffn(self.macaron_norm(hidden_states), mask.float())
             hidden_states = hidden_states + 0.5 * self.dropout(macaron_out)
 
             key_padding_mask = ~mask.bool()
             attn_input = self.self_attn_norm(hidden_states)
-            attn_output, _ = self.self_attn(
-                attn_input,
-                attn_input,
-                attn_input,
+            attn_output = self.self_attn(
+                attn_input, attn_input, attn_input,
+                pos_enc=pos_enc,
                 key_padding_mask=key_padding_mask,
-                need_weights=False,
             )
             hidden_states = hidden_states + self.dropout(attn_output)
             hidden_states = hidden_states + self.conv_module(hidden_states)
@@ -647,7 +848,7 @@ if TORCH_IMPORT_ERROR is None:
             self.num_experts = int(args.num_experts)
             self.ffn_type = args.ffn_type
             self.subsampling = Conv2dSubsampling(args.n_mels, args.encoder_dim, args.dropout)
-            self.position = SinusoidalPositionalEncoding(args.encoder_dim)
+            self.position = RelativePositionalEncoding(args.encoder_dim, dropout=args.dropout)
             block_cls = TransformerMoEBlock if args.encoder_type == "transformer" else ConformerMoEBlock
             self.blocks = nn.ModuleList([block_cls(args) for _ in range(args.encoder_layers)])
             self.output_norm = nn.LayerNorm(args.encoder_dim)
@@ -658,6 +859,20 @@ if TORCH_IMPORT_ERROR is None:
             )
             self.ctc_head = nn.Linear(args.projector_dim, vocab_size)
 
+            inter_weight = float(getattr(args, "intermediate_ctc_weight", 0.0))
+            inter_layer = int(getattr(args, "intermediate_ctc_layer", 0))
+            if inter_layer <= 0:
+                inter_layer = max(1, args.encoder_layers // 2)
+            self._inter_ctc_layer = inter_layer if inter_weight > 0 else -1
+            if self._inter_ctc_layer >= 0:
+                self.inter_norm = nn.LayerNorm(args.encoder_dim)
+                self.inter_proj = nn.Sequential(
+                    nn.Linear(args.encoder_dim, args.projector_dim),
+                    nn.GELU(),
+                    nn.Dropout(args.dropout),
+                )
+                self.inter_ctc_head = nn.Linear(args.projector_dim, vocab_size)
+
         def forward(
             self,
             inputs: torch.Tensor,
@@ -665,13 +880,14 @@ if TORCH_IMPORT_ERROR is None:
             forced_expert: int | None = None,
             forced_experts: dict[int, int] | None = None,
             return_aux: bool = False,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any] | None]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any] | None, torch.Tensor | None]:
             hidden_states, output_lengths = self.subsampling(inputs, input_lengths.to(inputs.device))
-            hidden_states = self.position(hidden_states)
+            hidden_states, pos_enc = self.position(hidden_states)
             mask = lengths_to_mask(output_lengths.to(hidden_states.device), hidden_states.size(1))
 
             routing_values: list[torch.Tensor] = []
             block_aux: list[dict[str, Any]] = []
+            intermediate_log_probs: torch.Tensor | None = None
             for block_idx, block in enumerate(self.blocks):
                 block_forced_expert = forced_expert
                 if forced_experts is not None:
@@ -679,6 +895,7 @@ if TORCH_IMPORT_ERROR is None:
                 hidden_states, routing, aux = block(
                     hidden_states,
                     mask,
+                    pos_enc,
                     forced_expert=block_forced_expert,
                     return_all_experts=return_aux,
                 )
@@ -692,6 +909,10 @@ if TORCH_IMPORT_ERROR is None:
                             "aux": aux,
                         }
                     )
+                if self._inter_ctc_layer >= 0 and block_idx == self._inter_ctc_layer and self.training:
+                    inter_hidden = self.inter_norm(hidden_states)
+                    inter_proj = self.inter_proj(inter_hidden)
+                    intermediate_log_probs = F.log_softmax(self.inter_ctc_head(inter_proj), dim=-1)
 
             hidden_states = self.output_norm(hidden_states)
             hidden_states = self.projector(hidden_states)
@@ -701,7 +922,7 @@ if TORCH_IMPORT_ERROR is None:
             aux_out = None
             if return_aux:
                 aux_out = {"block_aux": block_aux, "mask": mask, "output_lengths": output_lengths}
-            return log_probs, output_lengths, merged_routing, aux_out
+            return log_probs, output_lengths, merged_routing, aux_out, intermediate_log_probs
 
         def get_moe_modules(self) -> list[SharedAdapterMoEFFN]:
             modules: list[SharedAdapterMoEFFN] = []
@@ -715,6 +936,8 @@ if TORCH_IMPORT_ERROR is None:
 else:
     SinusoidalPositionalEncoding = None
     Conv2dSubsampling = None
+    RelativePositionalEncoding = None
+    RelativeMultiHeadAttention = None
     DenseFFN = None
     SharedAdapterMoEFFN = None
     ConformerConvModule = None
@@ -805,7 +1028,7 @@ def compute_expert_scores(
             forward_kwargs["forced_experts"] = {block_idx: expert_idx}
 
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            expert_log_probs, expert_output_lengths, _, _ = model(
+            expert_log_probs, expert_output_lengths, _, _, _ = model(
                 batch["inputs"],
                 batch["input_lengths"],
                 **forward_kwargs,
@@ -974,6 +1197,17 @@ def should_compute_train_competition(args: argparse.Namespace, epoch: int, step:
     return step % interval == 0
 
 
+def get_annealed_temperature(args: argparse.Namespace, epoch: int) -> float:
+    """Linearly anneal router temperature from start to end over anneal_epochs."""
+    anneal_epochs = int(getattr(args, "temperature_anneal_epochs", 0))
+    if anneal_epochs <= 0:
+        return float(args.router_temperature)
+    t_start = float(getattr(args, "temperature_anneal_start", None) or args.router_temperature)
+    t_end = float(getattr(args, "temperature_anneal_end", None) or args.router_temperature)
+    progress = min(1.0, max(0.0, epoch / anneal_epochs))
+    return t_start + (t_end - t_start) * progress
+
+
 def should_run_expert_evolution(args: argparse.Namespace, epoch: int) -> bool:
     if args.ffn_type != "shared_adapter_moe" or args.expert_evolve_every_epochs <= 0:
         return False
@@ -1032,8 +1266,12 @@ def evaluate(
     total_base_loss = 0.0
     total_lb_loss = 0.0
     total_comp_loss = 0.0
-    total_cer = 0.0
-    total_wer = 0.0
+    total_mean_cer = 0.0
+    total_mean_wer = 0.0
+    total_char_edits = 0
+    total_char_length = 0
+    total_word_edits = 0
+    total_word_length = 0
     total_entropy = 0.0
     total_gate_mass: torch.Tensor | None = None
     total_gate_count = 0
@@ -1051,7 +1289,7 @@ def evaluate(
     for step, batch in enumerate(iterator, start=1):
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            log_probs, output_lengths, routing, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            log_probs, output_lengths, routing, _, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
             per_sample_base_loss = compute_per_sample_ctc_losses(
                 log_probs,
                 batch["targets"],
@@ -1074,7 +1312,7 @@ def evaluate(
                 comp_loss = routing_alignment_loss(routing, comp_targets, eps=args.competition_epsilon)
                 expert_fitness_storage.append(fitness.detach().cpu())
 
-        hypotheses = decode_batch(log_probs, output_lengths, tokenizer)
+        hypotheses = select_hypotheses(log_probs, output_lengths, tokenizer, args)
         batch_size = len(hypotheses)
         batch_shared_penalty = args.load_balance_weight * lb_loss.detach() + effective_comp_weight * comp_loss.detach()
         sample_total_loss = per_sample_base_loss.detach() + batch_shared_penalty
@@ -1084,8 +1322,15 @@ def evaluate(
         total_lb_loss += float(lb_loss.detach().item()) * batch_size
         total_comp_loss += float(comp_loss.detach().item()) * batch_size
         for idx, (ref, hyp) in enumerate(zip(batch["texts"], hypotheses)):
-            total_cer += compute_cer(ref, hyp)
-            total_wer += compute_wer(ref, hyp)
+            normalized_ref = normalize_eval_text(ref, args)
+            normalized_hyp = normalize_eval_text(hyp, args)
+            total_mean_cer += compute_cer(normalized_ref, normalized_hyp)
+            total_mean_wer += compute_wer(normalized_ref, normalized_hyp)
+            error_totals = compute_text_error_totals(normalized_ref, normalized_hyp)
+            total_char_edits += error_totals["char_edits"]
+            total_char_length += error_totals["char_length"]
+            total_word_edits += error_totals["word_edits"]
+            total_word_length += error_totals["word_length"]
             domain = batch["domains"][idx]
             domain_loss_sum[domain] += float(sample_total_loss[idx].item())
             domain_loss_count[domain] += 1
@@ -1101,12 +1346,17 @@ def evaluate(
             total_gate_count += routing.size(0)
 
         if hasattr(iterator, "set_postfix"):
-            iterator.set_postfix(loss=f"{total_loss / max(1, total_weight):.4f}", cer=f"{total_cer / max(1, samples):.4f}")
+            iterator.set_postfix(
+                loss=f"{total_loss / max(1, total_weight):.4f}",
+                cer=f"{total_mean_cer / max(1, samples):.4f}",
+            )
 
     avg_gates = []
     if total_gate_mass is not None and total_gate_count > 0:
         avg_gates = [round(float(v), 6) for v in (total_gate_mass / total_gate_count).tolist()]
 
+    corpus_cer = total_char_edits / max(1, total_char_length)
+    corpus_wer = total_word_edits / max(1, total_word_length)
     metrics = {
         "loss": total_loss / max(1, total_weight),
         "total_loss": total_loss / max(1, total_weight),
@@ -1114,8 +1364,12 @@ def evaluate(
         "ctc_loss": total_base_loss / max(1, total_weight),
         "load_balance_loss": total_lb_loss / max(1, total_weight),
         "competition_loss": total_comp_loss / max(1, total_weight),
-        "cer": total_cer / max(1, samples),
-        "wer": total_wer / max(1, samples),
+        "cer": corpus_cer,
+        "wer": corpus_wer,
+        "mean_cer": total_mean_cer / max(1, samples),
+        "mean_wer": total_mean_wer / max(1, samples),
+        "corpus_cer": corpus_cer,
+        "corpus_wer": corpus_wer,
         "routing": summarize_routing(routing_by_domain),
         "avg_gates": avg_gates,
         "expert_usage": avg_gates,
@@ -1153,11 +1407,14 @@ def train_one_epoch(
 ) -> dict[str, Any]:
     del tokenizer
     model.train()
+    accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
     running_loss = 0.0
     running_base_loss = 0.0
     running_lb_loss = 0.0
     running_comp_loss = 0.0
+    running_inter_ctc_loss = 0.0
     running_entropy = 0.0
+    running_entropy_bonus = 0.0
     running_grad_norm = 0.0
     running_gate_mass: torch.Tensor | None = None
     running_gate_count = 0
@@ -1197,17 +1454,50 @@ def train_one_epoch(
         timing_sums["transfer"] += transfer_time
         if profile_enabled and step == 1:
             print(f"epoch={epoch} first batch moved to device in {transfer_time:.4f}s", flush=True)
-        optimizer.zero_grad(set_to_none=True)
+
+        if (step - 1) % accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
+
+        if getattr(args, "spec_augment", False):
+            batch["inputs"] = spec_augment(
+                batch["inputs"],
+                freq_mask_param=int(getattr(args, "freq_mask_param", 27)),
+                time_mask_param=int(getattr(args, "time_mask_param", 100)),
+                num_freq_masks=int(getattr(args, "num_freq_masks", 2)),
+                num_time_masks=int(getattr(args, "num_time_masks", 2)),
+            )
 
         forward_start = time.perf_counter()
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            log_probs, output_lengths, routing, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
-            base_loss = ctc_loss(
+            log_probs, output_lengths, routing, _, inter_log_probs = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            raw_ctc_loss = ctc_loss(
                 log_probs.transpose(0, 1),
                 batch["targets"],
                 output_lengths.cpu(),
                 batch["target_lengths"],
             )
+            label_smooth_val = float(getattr(args, "label_smoothing", 0.0))
+            if label_smooth_val > 0.0:
+                uniform_ent = -log_probs.mean()
+                base_loss = (1.0 - label_smooth_val) * raw_ctc_loss + label_smooth_val * uniform_ent
+            else:
+                base_loss = raw_ctc_loss
+
+            inter_ctc_loss = torch.tensor(0.0, device=log_probs.device)
+            inter_ctc_weight = float(getattr(args, "intermediate_ctc_weight", 0.0))
+            if inter_ctc_weight > 0.0 and inter_log_probs is not None:
+                raw_inter_ctc = ctc_loss(
+                    inter_log_probs.transpose(0, 1),
+                    batch["targets"],
+                    output_lengths.cpu(),
+                    batch["target_lengths"],
+                )
+                if label_smooth_val > 0.0:
+                    inter_uniform_ent = -inter_log_probs.mean()
+                    inter_ctc_loss = (1.0 - label_smooth_val) * raw_inter_ctc + label_smooth_val * inter_uniform_ent
+                else:
+                    inter_ctc_loss = raw_inter_ctc
+
             lb_loss = (
                 routing_regularizer(routing, args.num_experts)
                 if routing is not None
@@ -1236,13 +1526,16 @@ def train_one_epoch(
         if profile_enabled and step == 1:
             print(f"epoch={epoch} first batch competition done in {competition_time:.4f}s", flush=True)
 
-        loss = base_loss + args.load_balance_weight * lb_loss + effective_comp_weight * comp_loss
+        entropy_bonus_weight = float(getattr(args, "entropy_bonus_weight", 0.0))
+        routing_ent = routing_entropy(routing, eps=args.competition_epsilon) if routing is not None else torch.tensor(0.0, device=log_probs.device)
+        loss = base_loss + args.load_balance_weight * lb_loss + effective_comp_weight * comp_loss - entropy_bonus_weight * routing_ent + inter_ctc_weight * inter_ctc_loss
 
+        scaled_loss = loss / accum_steps
         backward_start = time.perf_counter()
         if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss).backward()
+            scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
+            scaled_loss.backward()
         synchronize_for_timing(device, profile_enabled)
         backward_time = time.perf_counter() - backward_start
         timing_sums["backward"] += backward_time
@@ -1250,16 +1543,18 @@ def train_one_epoch(
             print(f"epoch={epoch} first batch backward done in {backward_time:.4f}s", flush=True)
 
         optimizer_start = time.perf_counter()
-        if scaler is not None and scaler.is_enabled():
-            scaler.unscale_(optimizer)
-            grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
-            optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        grad_norm = 0.0
+        if step % accum_steps == 0 or step == len(loader):
+            if scaler is not None and scaler.is_enabled():
+                scaler.unscale_(optimizer)
+                grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
+                optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
         synchronize_for_timing(device, profile_enabled)
         optimizer_time = time.perf_counter() - optimizer_start
         timing_sums["optimizer"] += optimizer_time
@@ -1276,7 +1571,10 @@ def train_one_epoch(
         running_base_loss += float(base_loss.item()) * batch_size
         running_lb_loss += float(lb_loss.item()) * batch_size
         running_comp_loss += float(comp_loss.item()) * batch_size
+        running_inter_ctc_loss += float(inter_ctc_loss.item()) * batch_size
         running_grad_norm += grad_norm * batch_size
+        if routing is not None and entropy_bonus_weight > 0.0:
+            running_entropy_bonus += float(routing_ent.detach().item()) * batch_size
         if routing is not None:
             running_entropy += float(routing_entropy(routing, eps=args.competition_epsilon).item()) * routing.size(0)
             gate_sum = routing.detach().sum(dim=0).cpu()
@@ -1294,6 +1592,8 @@ def train_one_epoch(
                 f"ctc={running_base_loss / max(1, running_total_weight):.4f} "
                 f"lb={running_lb_loss / max(1, running_total_weight):.4f} "
                 f"comp={running_comp_loss / max(1, running_total_weight):.4f} "
+                f"inter_ctc={running_inter_ctc_loss / max(1, running_total_weight):.4f} "
+                f"ent_bonus={running_entropy_bonus / max(1, running_total_weight):.4f} "
                 f"grad={running_grad_norm / max(1, running_total_weight):.4f} "
                 f"lr={current_lr:.6g}",
                 flush=True,
@@ -1308,6 +1608,7 @@ def train_one_epoch(
                     "train/ctc_loss_step": running_base_loss / max(1, running_total_weight),
                     "train/load_balance_loss_step": running_lb_loss / max(1, running_total_weight),
                     "train/competition_loss_step": running_comp_loss / max(1, running_total_weight),
+                    "train/inter_ctc_loss_step": running_inter_ctc_loss / max(1, running_total_weight),
                     "train/grad_norm_step": running_grad_norm / max(1, running_total_weight),
                     "train/lr": current_lr,
                 },
@@ -1347,7 +1648,9 @@ def train_one_epoch(
         "ctc_loss": running_base_loss / max(1, running_total_weight),
         "load_balance_loss": running_lb_loss / max(1, running_total_weight),
         "competition_loss": running_comp_loss / max(1, running_total_weight),
+        "inter_ctc_loss": running_inter_ctc_loss / max(1, running_total_weight),
         "routing_entropy": running_entropy / max(1, running_gate_count),
+        "entropy_bonus": running_entropy_bonus / max(1, running_total_weight),
         "grad_norm": running_grad_norm / max(1, running_total_weight),
         "lr": float(optimizer.param_groups[0]["lr"]),
         "effective_competition_weight": effective_comp_weight,
@@ -1394,7 +1697,7 @@ def collect_evolution_statistics(
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
 
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            _, _, _, aux = model(batch["inputs"], batch["input_lengths"], return_aux=True)
+            _, _, _, aux, _ = model(batch["inputs"], batch["input_lengths"], return_aux=True)
 
         if aux is not None:
             for block_entry in aux["block_aux"]:
@@ -1506,8 +1809,10 @@ def main() -> None:
     ensure_torch()
     set_seed(args.seed)
 
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = prepare_output_dir(
+        Path(args.output_dir).resolve(),
+        allow_existing=bool(getattr(args, "allow_existing_output_dir", False)),
+    )
     save_json(output_dir / "config.json", vars(args))
     wandb_run = init_wandb_run(args, output_dir, vars(args))
 
@@ -1519,6 +1824,7 @@ def main() -> None:
             train_records,
             args=args,
             train_manifest=args.train_manifest,
+            output_dir=output_dir,
         )
         tokenizer.save(output_dir / "vocab.json")
 
@@ -1618,7 +1924,7 @@ def main() -> None:
                 flush=True,
             )
 
-        best_valid_loss = float("inf")
+        best_valid_cer = float("inf")
         no_improve_rounds = 0
         eval_every = max(1, int(args.eval_every_epochs))
         patience = max(0, int(args.early_stop_patience))
@@ -1640,6 +1946,13 @@ def main() -> None:
                 use_amp=use_amp,
                 scheduler=scheduler,
             )
+
+            # Anneal router temperature
+            if int(getattr(args, "temperature_anneal_epochs", 0)) > 0:
+                new_temp = get_annealed_temperature(args, epoch)
+                for moe_module in raw_model.get_moe_modules():
+                    moe_module.temperature = new_temp
+                print(f"epoch={epoch} router_temperature={new_temp:.4f}", flush=True)
 
             evolve_logs: list[dict[str, Any]] = []
             if should_run_expert_evolution(args, epoch):
@@ -1721,6 +2034,10 @@ def main() -> None:
                 "valid_competition_loss": round(valid_metrics["competition_loss"], 6),
                 "valid_cer": round(valid_metrics["cer"], 6),
                 "valid_wer": round(valid_metrics["wer"], 6),
+                "valid_mean_cer": round(valid_metrics["mean_cer"], 6),
+                "valid_mean_wer": round(valid_metrics["mean_wer"], 6),
+                "valid_corpus_cer": round(valid_metrics["corpus_cer"], 6),
+                "valid_corpus_wer": round(valid_metrics["corpus_wer"], 6),
                 "valid_routing": valid_metrics["routing"],
                 "valid_avg_gates": valid_metrics.get("avg_gates", []),
                 "valid_expert_usage": valid_metrics.get("expert_usage", []),
@@ -1735,12 +2052,13 @@ def main() -> None:
             history.append(epoch_metrics)
             print(
                 f"epoch={epoch} valid_loss={valid_metrics['loss']:.4f} "
-                f"valid_cer={valid_metrics['cer']:.4f} valid_wer={valid_metrics['wer']:.4f}",
+                f"valid_cer={valid_metrics['cer']:.4f} valid_wer={valid_metrics['wer']:.4f} "
+                f"mean_cer={valid_metrics['mean_cer']:.4f} mean_wer={valid_metrics['mean_wer']:.4f}",
                 flush=True,
             )
 
             global_step = epoch * len(train_loader)
-            is_best = valid_metrics["loss"] < best_valid_loss
+            is_best = valid_metrics["cer"] < best_valid_cer
             log_payload = {
                 "global_step": global_step,
                 "epoch": epoch,
@@ -1760,6 +2078,10 @@ def main() -> None:
                 "valid/competition_loss": valid_metrics["competition_loss"],
                 "valid/cer": valid_metrics["cer"],
                 "valid/wer": valid_metrics["wer"],
+                "valid/mean_cer": valid_metrics["mean_cer"],
+                "valid/mean_wer": valid_metrics["mean_wer"],
+                "valid/corpus_cer": valid_metrics["corpus_cer"],
+                "valid/corpus_wer": valid_metrics["corpus_wer"],
                 "valid/routing_entropy": valid_metrics["routing_entropy"],
                 "valid/effective_competition_weight": valid_metrics.get("effective_competition_weight", 0.0),
                 "valid/is_best": int(is_best),
@@ -1782,7 +2104,7 @@ def main() -> None:
             log_wandb_metrics(wandb_run, log_payload)
 
             if is_best:
-                best_valid_loss = valid_metrics["loss"]
+                best_valid_cer = valid_metrics["cer"]
                 no_improve_rounds = 0
                 torch.save(
                     {
@@ -1791,7 +2113,7 @@ def main() -> None:
                         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
                         "config": vars(args),
                         "vocab": tokenizer.id_to_token,
-                        "best_valid_loss": best_valid_loss,
+                        "best_valid_cer": best_valid_cer,
                     },
                     output_dir / "best.pt",
                 )
@@ -1801,14 +2123,14 @@ def main() -> None:
                     {
                         "global_step": global_step,
                         "epoch": epoch,
-                        "valid/best_loss": best_valid_loss,
+                        "valid/best_cer": best_valid_cer,
                     },
                 )
             else:
                 no_improve_rounds += 1
                 if patience > 0 and no_improve_rounds >= patience:
                     print(
-                        f"Early stopping at epoch {epoch}: no validation loss improvement in "
+                        f"Early stopping at epoch {epoch}: no validation CER improvement in "
                         f"{no_improve_rounds} eval rounds.",
                         flush=True,
                     )
@@ -1833,7 +2155,8 @@ def main() -> None:
             save_json(output_dir / "test_metrics.json", test_metrics)
             print(
                 f"test_loss={test_metrics['loss']:.4f} test_cer={test_metrics['cer']:.4f} "
-                f"test_wer={test_metrics['wer']:.4f}",
+                f"test_wer={test_metrics['wer']:.4f} "
+                f"mean_cer={test_metrics['mean_cer']:.4f} mean_wer={test_metrics['mean_wer']:.4f}",
                 flush=True,
             )
             test_log_payload = {
@@ -1846,6 +2169,10 @@ def main() -> None:
                 "test/competition_loss": test_metrics["competition_loss"],
                 "test/cer": test_metrics["cer"],
                 "test/wer": test_metrics["wer"],
+                "test/mean_cer": test_metrics["mean_cer"],
+                "test/mean_wer": test_metrics["mean_wer"],
+                "test/corpus_cer": test_metrics["corpus_cer"],
+                "test/corpus_wer": test_metrics["corpus_wer"],
                 "test/routing_entropy": test_metrics["routing_entropy"],
                 **flatten_routing_metrics("test", test_metrics["routing"]),
                 **flatten_scalar_metrics("test/domain_loss", test_metrics.get("domain_loss", {})),

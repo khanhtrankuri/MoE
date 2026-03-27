@@ -4,7 +4,10 @@ import io
 import json
 import re
 import wave
+from collections import Counter
 from pathlib import Path
+
+from text_utils import collect_out_of_script_chars, normalize_transcript, preview_text
 
 AUTO = "auto"
 AUDIO_COLUMN_CANDIDATES = ("audio", "speech", "wav", "sound")
@@ -110,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         "--repo-cache",
         default=None,
         help="Optional cache directory passed to load_dataset.",
+    )
+    parser.add_argument(
+        "--text-normalization",
+        choices=("none", "nfc", "nfkc"),
+        default="nfc",
+        help="Unicode normalization applied to exported transcripts.",
     )
     return parser.parse_args()
 
@@ -420,12 +429,16 @@ def export_split(
     language_column: str | None,
     default_language: str,
     target_sample_rate: int,
-) -> list[dict]:
+    text_normalization: str,
+) -> tuple[list[dict], dict]:
     split_audio_dir = output_dir / "audio" / split_name
     manifests_dir = output_dir / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict] = []
+    out_of_script_counts: Counter[str] = Counter()
+    out_of_script_examples: list[dict] = []
+    bom_removed_samples = 0
     total_rows = len(split_dataset)
     for index, row in enumerate(split_dataset):
         audio = row[audio_column]
@@ -442,12 +455,28 @@ def export_split(
         write_wav(audio_path, export_array, export_sample_rate)
 
         duration_seconds = float(len(export_array) / export_sample_rate)
+        raw_text = optional_value(row, text_column)
+        bom_removed_samples += raw_text.count("\ufeff")
+        unicode_form = None if text_normalization == "none" else text_normalization.upper()
+        normalized_text = normalize_transcript(raw_text, unicode_form=unicode_form)
+        flagged_chars = set(collect_out_of_script_chars(normalized_text))
+        for ch in normalized_text:
+            if ch in flagged_chars:
+                out_of_script_counts[ch] += 1
+        if flagged_chars and len(out_of_script_examples) < 20:
+            out_of_script_examples.append(
+                {
+                    "id": sample_id,
+                    "chars": [ch.encode("unicode_escape").decode("ascii") for ch in sorted(flagged_chars)],
+                    "text_preview": preview_text(normalized_text, limit=160).encode("unicode_escape").decode("ascii"),
+                }
+            )
         record = {
             "id": sample_id,
             "split": split_name,
             "audio_filepath": str(audio_path.resolve()),
             "audio_relpath": str(audio_path.relative_to(output_dir)),
-            "text": optional_value(row, text_column),
+            "text": normalized_text,
             "speaker_id": optional_value(row, speaker_column),
             "gender": optional_value(row, gender_column),
             "language": optional_value(row, language_column) or default_language,
@@ -473,7 +502,16 @@ def export_split(
             writer.writeheader()
             writer.writerows(records)
 
-    return records
+    audit = {
+        "text_normalization": text_normalization,
+        "bom_removed_samples": bom_removed_samples,
+        "out_of_script_char_counts": {
+            key.encode("unicode_escape").decode("ascii"): value
+            for key, value in sorted(out_of_script_counts.items(), key=lambda item: item[0])
+        },
+        "out_of_script_examples": out_of_script_examples,
+    }
+    return records, audit
 
 
 def main() -> None:
@@ -547,6 +585,7 @@ def main() -> None:
         print("Preserving source sample rates")
 
     summary: dict[str, dict] = {}
+    text_audit_by_split: dict[str, dict] = {}
     all_records: list[dict] = []
     for split_name, split_dataset in dataset_dict.items():
         if args.max_samples is not None:
@@ -554,7 +593,7 @@ def main() -> None:
             split_dataset = split_dataset.select(range(limit))
 
         print(f"Processing split '{split_name}' with {len(split_dataset)} rows")
-        records = export_split(
+        records, text_audit = export_split(
             split_name=split_name,
             split_dataset=split_dataset,
             output_dir=output_dir,
@@ -566,12 +605,14 @@ def main() -> None:
             language_column=args.language_column,
             default_language=args.default_language,
             target_sample_rate=args.sample_rate,
+            text_normalization=args.text_normalization,
         )
         all_records.extend(records)
         summary[split_name] = {
             "num_rows": len(records),
             "total_duration_seconds": round(sum(item["duration_seconds"] for item in records), 6),
         }
+        text_audit_by_split[split_name] = text_audit
 
     summary_path = output_dir / "dataset_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
@@ -590,7 +631,9 @@ def main() -> None:
                     "language": args.language_column,
                 },
                 "default_language": args.default_language,
+                "text_normalization": args.text_normalization,
                 "splits": summary,
+                "text_audit": text_audit_by_split,
                 "total_rows": len(all_records),
                 "total_duration_seconds": round(
                     sum(item["duration_seconds"] for item in all_records), 6
