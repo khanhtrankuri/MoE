@@ -701,7 +701,7 @@ if TORCH_IMPORT_ERROR is None:
             aux_out = None
             if return_aux:
                 aux_out = {"block_aux": block_aux, "mask": mask, "output_lengths": output_lengths}
-            return log_probs, output_lengths.cpu(), merged_routing, aux_out
+            return log_probs, output_lengths, merged_routing, aux_out
 
         def get_moe_modules(self) -> list[SharedAdapterMoEFFN]:
             modules: list[SharedAdapterMoEFFN] = []
@@ -770,8 +770,8 @@ def compute_per_sample_ctc_losses(
     raw_losses = F.ctc_loss(
         log_probs.transpose(0, 1),
         targets,
-        output_lengths,
-        target_lengths,
+        output_lengths.cpu(),
+        target_lengths.cpu(),
         blank=blank_id,
         reduction="none",
         zero_infinity=zero_infinity,
@@ -1205,7 +1205,7 @@ def train_one_epoch(
             base_loss = ctc_loss(
                 log_probs.transpose(0, 1),
                 batch["targets"],
-                output_lengths,
+                output_lengths.cpu(),
                 batch["target_lengths"],
             )
             lb_loss = (

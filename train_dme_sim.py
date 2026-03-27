@@ -658,21 +658,22 @@ def build_raw_collate_fn(args, tokenizer: CharTokenizer):
     return collate_fn
 
 
-def build_cached_collate_fn():
-    def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-        features = [sample["features"] for sample in batch]
-        targets = [sample["token_ids"] for sample in batch]
-        return {
-            "inputs": pad_sequence(features, batch_first=True),
-            "input_lengths": torch.tensor([sample["feature_length"] for sample in batch], dtype=torch.long),
-            "targets": torch.cat(targets),
-            "target_lengths": torch.tensor([sample["target_length"] for sample in batch], dtype=torch.long),
-            "texts": [sample["text"] for sample in batch],
-            "ids": [sample["id"] for sample in batch],
-            "domains": [sample["domain"] for sample in batch],
-        }
+def _cached_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    features = [sample["features"] for sample in batch]
+    targets = [sample["token_ids"] for sample in batch]
+    return {
+        "inputs": pad_sequence(features, batch_first=True),
+        "input_lengths": torch.tensor([sample["feature_length"] for sample in batch], dtype=torch.long),
+        "targets": torch.cat(targets),
+        "target_lengths": torch.tensor([sample["target_length"] for sample in batch], dtype=torch.long),
+        "texts": [sample["text"] for sample in batch],
+        "ids": [sample["id"] for sample in batch],
+        "domains": [sample["domain"] for sample in batch],
+    }
 
-    return collate_fn
+
+def build_cached_collate_fn():
+    return _cached_collate_fn
 
 
 def build_collate_fn(args, tokenizer: CharTokenizer):
