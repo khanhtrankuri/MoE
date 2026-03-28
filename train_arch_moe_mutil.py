@@ -123,6 +123,13 @@ def parse_args() -> argparse.Namespace:
              "num_experts must be divisible by world_size. "
              "Use --no-expert-parallel to fall back to Data Parallel.",
     )
+    parser.add_argument(
+        "--dist-backend",
+        choices=("nccl", "gloo", "auto"),
+        default="auto",
+        help="Distributed backend. 'auto' uses nccl when CUDA is available, "
+             "gloo otherwise. Use 'gloo' on Kaggle/environments with NCCL issues.",
+    )
     # ── Training ─────────────────────────────────────────────────────────
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -1478,9 +1485,29 @@ def main() -> None:
     use_ep      = bool(getattr(args, "expert_parallel", True)) and world_size > 1
 
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        # Select backend: nccl is fastest on GPU clusters; gloo works on Kaggle/sandboxed envs
+        _backend_arg = getattr(args, "dist_backend", "auto")
+        if _backend_arg == "auto":
+            _backend = "nccl" if torch.cuda.is_available() else "gloo"
+        else:
+            _backend = _backend_arg
+
+        # Apply Kaggle/sandbox-friendly NCCL env vars if not already set
+        if _backend == "nccl":
+            os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+            os.environ.setdefault("NCCL_IB_DISABLE", "1")
+            os.environ.setdefault("NCCL_SOCKET_NTHREADS", "2")
+            os.environ.setdefault("NCCL_NSOCKS_PERTHREAD", "2")
+
+        import datetime
+        dist.init_process_group(
+            backend=_backend,
+            timeout=datetime.timedelta(seconds=1800),
+        )
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
+        if is_main:
+            print(f"Distributed backend: {_backend}", flush=True)
 
         if use_ep:
             if args.ffn_type == "shared_adapter_moe" and args.num_experts % world_size != 0:
