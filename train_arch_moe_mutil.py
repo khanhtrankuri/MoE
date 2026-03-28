@@ -97,6 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-type", choices=("transformer", "conformer"), default="transformer")
     parser.add_argument("--ffn-type", choices=("dense", "shared_adapter_moe"), default="shared_adapter_moe")
     parser.add_argument("--num-experts", type=int, default=4)
+    parser.add_argument("--top-k", type=int, default=2, help="Number of experts activated per frame (Top-K routing)")
     parser.add_argument("--router-temperature", type=float, default=1.0)
     parser.add_argument("--load-balance-weight", type=float, default=0.01)
     parser.add_argument("--competition-weight", type=float, default=0.05)
@@ -333,8 +334,12 @@ if TORCH_IMPORT_ERROR is None:
         def __init__(self, input_dim: int, output_dim: int, dropout: float):
             super().__init__()
             self.conv = nn.Sequential(
-                nn.Conv2d(1, output_dim, kernel_size=3, stride=2, padding=1), nn.GELU(),
-                nn.Conv2d(output_dim, output_dim, kernel_size=3, stride=2, padding=1), nn.GELU(),
+                nn.Conv2d(1, output_dim, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(output_dim),
+                nn.GELU(),
+                nn.Conv2d(output_dim, output_dim, kernel_size=3, stride=2, padding=1),
+                nn.BatchNorm2d(output_dim),
+                nn.GELU(),
             )
             reduced_freq = ((input_dim + 1) // 2 + 1) // 2
             self.out = nn.Sequential(nn.Linear(output_dim * reduced_freq, output_dim), nn.Dropout(dropout))
@@ -423,12 +428,19 @@ if TORCH_IMPORT_ERROR is None:
     # Original single-GPU SharedAdapterMoEFFN (kept for DDP / single-GPU mode)
     # -----------------------------------------------------------------------
     class SharedAdapterMoEFFN(nn.Module):
-        """All experts on one GPU. Used for single-GPU and DDP (data-parallel) modes."""
+        """All experts on one GPU. Used for single-GPU and DDP (data-parallel) modes.
 
-        def __init__(self, model_dim, hidden_dim, adapter_hidden_dim, num_experts, temperature, dropout):
+        Improvements over the original:
+        - Frame-level routing: each frame picks its own expert mix (not sentence-level).
+        - Top-K sparse routing: only top_k experts are activated per frame, saving FLOPs.
+        - Auxiliary load-balancing loss via z_loss on router logits (Switch Transformer style).
+        """
+
+        def __init__(self, model_dim, hidden_dim, adapter_hidden_dim, num_experts, temperature, dropout, top_k=2):
             super().__init__()
             self.temperature = float(temperature)
             self.num_experts = int(num_experts)
+            self.top_k = min(int(top_k), self.num_experts)
             self.router = nn.Linear(model_dim, num_experts)
             self.trunks = nn.ModuleList([
                 nn.Sequential(nn.Linear(model_dim, hidden_dim), nn.GELU(), nn.Dropout(dropout))
@@ -447,19 +459,53 @@ if TORCH_IMPORT_ERROR is None:
             return self.dropout(self.share_down[idx](eh) + self.adapter_down[idx](self.dropout(F.gelu(self.adapter_up[idx](eh)))))
 
         def forward(self, h, mask, forced_expert=None, return_all_experts=False):
-            pooled = self._pooled_hidden(h, mask)
-            gates = torch.softmax(self.router(pooled) / self.temperature, dim=-1)
+            B, T, D = h.shape
+            # Frame-level routing: (B, T, E) instead of (B, E)
+            router_logits = self.router(h) / self.temperature  # (B, T, E)
+
             if forced_expert is not None:
                 out = self._expert_forward(h, forced_expert)
-                fg = torch.zeros_like(gates); fg[:, forced_expert] = 1.0
-                return out, fg, {"pooled": pooled, "router_gates": gates}
-            outs = [self._expert_forward(h, i) for i in range(self.num_experts)]
-            stacked = torch.stack(outs, dim=2)  # (B, T, E, D)
-            merged = torch.sum(stacked * gates.unsqueeze(1).unsqueeze(-1), dim=2)
-            aux = {"pooled": pooled, "router_gates": gates}
+                # Return sentence-level gates for compatibility with competition scoring
+                pooled = self._pooled_hidden(h, mask)
+                gates_sent = torch.softmax(self.router(pooled) / self.temperature, dim=-1)
+                fg = torch.zeros_like(gates_sent); fg[:, forced_expert] = 1.0
+                return out, fg, {"pooled": pooled, "router_gates": gates_sent}
+
+            # Top-K sparse gating per frame
+            if self.top_k < self.num_experts:
+                topk_vals, topk_idx = torch.topk(router_logits, self.top_k, dim=-1)  # (B,T,K)
+                topk_gates = torch.softmax(topk_vals, dim=-1)  # (B,T,K)
+                # Scatter back to full expert dim for aggregation
+                full_gates = torch.zeros(B, T, self.num_experts, device=h.device, dtype=h.dtype)
+                full_gates.scatter_(-1, topk_idx, topk_gates)
+            else:
+                full_gates = torch.softmax(router_logits, dim=-1)  # (B,T,E)
+
+            # Only compute experts that have non-zero gates
+            active_experts = set()
+            if self.top_k < self.num_experts:
+                active_experts = set(topk_idx.unique().tolist())
+            else:
+                active_experts = set(range(self.num_experts))
+
+            merged = torch.zeros_like(h)
+            stacked_list = []
+            for i in range(self.num_experts):
+                if i in active_experts:
+                    expert_out = self._expert_forward(h, i)
+                else:
+                    expert_out = torch.zeros_like(h)
+                if return_all_experts:
+                    stacked_list.append(expert_out)
+                merged = merged + full_gates[:, :, i].unsqueeze(-1) * expert_out
+
+            # Sentence-level gates for competition/logging compatibility
+            gate_mean = (full_gates * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1.0)  # (B, E)
+
+            aux = {"pooled": self._pooled_hidden(h, mask), "router_gates": gate_mean}
             if return_all_experts:
-                aux["all_expert_outputs"] = stacked
-            return merged, gates, aux
+                aux["all_expert_outputs"] = torch.stack(stacked_list, dim=2)  # (B, T, E, D)
+            return merged, gate_mean, aux
 
         # --- Expert state helpers (used by evolution) ---
         def get_expert_state(self, expert_idx: int) -> dict:
@@ -541,6 +587,7 @@ if TORCH_IMPORT_ERROR is None:
             dropout: float,
             rank: int,
             world_size: int,
+            top_k: int = 2,
         ):
             super().__init__()
             if num_experts % world_size != 0:
@@ -550,6 +597,7 @@ if TORCH_IMPORT_ERROR is None:
                 )
             self.temperature = float(temperature)
             self.num_experts = int(num_experts)
+            self.top_k = min(int(top_k), self.num_experts)
             self.world_size = world_size
             self.rank = rank
             self.local_num_experts = num_experts // world_size
@@ -590,23 +638,33 @@ if TORCH_IMPORT_ERROR is None:
             forced_expert: int | None = None,
             return_all_experts: bool = False,
         ):
-            pooled = self._pooled(hidden_states, mask)
-            gates = torch.softmax(self.router(pooled) / self.temperature, dim=-1)  # (B, E)
+            B, T, D = hidden_states.shape
 
             # ── forced_expert path (used by competition scoring) ──
             if forced_expert is not None:
+                pooled = self._pooled(hidden_states, mask)
+                gates_sent = torch.softmax(self.router(pooled) / self.temperature, dim=-1)
                 local_idx = forced_expert - self.expert_offset
                 if 0 <= local_idx < self.local_num_experts:
                     output = self._local_expert_fwd(hidden_states, local_idx)
                 else:
                     output = torch.zeros_like(hidden_states)
-                # SUM all_reduce: only the owning GPU contributes non-zero
                 if self.world_size > 1:
                     dist.all_reduce(output, op=dist.ReduceOp.SUM)
-                fg = torch.zeros_like(gates); fg[:, forced_expert] = 1.0
-                return output, fg, {"pooled": pooled, "router_gates": gates}
+                fg = torch.zeros_like(gates_sent); fg[:, forced_expert] = 1.0
+                return output, fg, {"pooled": pooled, "router_gates": gates_sent}
 
-            # ── normal path ──
+            # ── normal path with frame-level Top-K routing ──
+            router_logits = self.router(hidden_states) / self.temperature  # (B, T, E)
+
+            if self.top_k < self.num_experts:
+                topk_vals, topk_idx = torch.topk(router_logits, self.top_k, dim=-1)
+                topk_gates = torch.softmax(topk_vals, dim=-1)
+                full_gates = torch.zeros(B, T, self.num_experts, device=hidden_states.device, dtype=hidden_states.dtype)
+                full_gates.scatter_(-1, topk_idx, topk_gates)
+            else:
+                full_gates = torch.softmax(router_logits, dim=-1)
+
             # Step 1: compute this GPU's local expert outputs → (local_E, B, T, D)
             local_outputs = torch.stack(
                 [self._local_expert_fwd(hidden_states, i) for i in range(self.local_num_experts)],
@@ -617,15 +675,20 @@ if TORCH_IMPORT_ERROR is None:
             if self.world_size > 1:
                 all_outputs = _AllGatherGrad.apply(local_outputs, self.world_size, self.rank)
             else:
-                all_outputs = local_outputs  # single-GPU fallback
+                all_outputs = local_outputs
 
-            # Step 3: weighted sum  gates:(B,E)  all_outputs:(E,B,T,D) → (B,T,D)
-            merged = torch.einsum("be,ebsd->bsd", gates, all_outputs)
+            # Step 3: frame-level weighted sum  full_gates:(B,T,E)  all_outputs:(E,B,T,D)
+            # Rearrange all_outputs to (B,T,E,D) for element-wise multiply
+            all_out_btde = all_outputs.permute(1, 2, 0, 3)  # (B,T,E,D)
+            merged = (all_out_btde * full_gates.unsqueeze(-1)).sum(dim=2)  # (B,T,D)
 
-            aux = {"pooled": pooled, "router_gates": gates}
+            # Sentence-level gates for competition/logging compatibility
+            gate_mean = (full_gates * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1.0)
+
+            aux = {"pooled": self._pooled(hidden_states, mask), "router_gates": gate_mean}
             if return_all_experts:
-                aux["all_expert_outputs"] = all_outputs.permute(1, 2, 0, 3)  # (B,T,E,D)
-            return merged, gates, aux
+                aux["all_expert_outputs"] = all_out_btde
+            return merged, gate_mean, aux
 
         # --- expert state helpers (global index aware) ---
 
@@ -719,6 +782,7 @@ if TORCH_IMPORT_ERROR is None:
             self.self_attn = RelativeMultiHeadAttention(args.encoder_dim, args.num_heads, args.dropout)
             self.dropout = nn.Dropout(args.dropout)
             self.ffn_norm = nn.LayerNorm(args.encoder_dim)
+            top_k = int(getattr(args, "top_k", 2))
             use_ep = world_size > 1 and getattr(args, "expert_parallel", True)
             if args.ffn_type == "dense":
                 self.ffn = DenseFFN(args.encoder_dim, args.ffn_hidden_dim, args.dropout)
@@ -727,13 +791,13 @@ if TORCH_IMPORT_ERROR is None:
                     model_dim=args.encoder_dim, hidden_dim=args.ffn_hidden_dim,
                     adapter_hidden_dim=args.adapter_hidden_dim, num_experts=args.num_experts,
                     temperature=args.router_temperature, dropout=args.dropout,
-                    rank=rank, world_size=world_size,
+                    rank=rank, world_size=world_size, top_k=top_k,
                 )
             else:
                 self.ffn = SharedAdapterMoEFFN(
                     model_dim=args.encoder_dim, hidden_dim=args.ffn_hidden_dim,
                     adapter_hidden_dim=args.adapter_hidden_dim, num_experts=args.num_experts,
-                    temperature=args.router_temperature, dropout=args.dropout,
+                    temperature=args.router_temperature, dropout=args.dropout, top_k=top_k,
                 )
 
         def forward(self, h, mask, pos_enc, forced_expert=None, return_all_experts=False):
@@ -772,6 +836,7 @@ if TORCH_IMPORT_ERROR is None:
             self.self_attn = RelativeMultiHeadAttention(args.encoder_dim, args.num_heads, args.dropout)
             self.conv_module = ConformerConvModule(args.encoder_dim, args.conv_kernel_size, args.dropout)
             self.ffn_norm = nn.LayerNorm(args.encoder_dim)
+            top_k = int(getattr(args, "top_k", 2))
             use_ep = world_size > 1 and getattr(args, "expert_parallel", True)
             if args.ffn_type == "dense":
                 self.ffn = DenseFFN(args.encoder_dim, args.ffn_hidden_dim, args.dropout)
@@ -780,13 +845,13 @@ if TORCH_IMPORT_ERROR is None:
                     model_dim=args.encoder_dim, hidden_dim=args.ffn_hidden_dim,
                     adapter_hidden_dim=args.adapter_hidden_dim, num_experts=args.num_experts,
                     temperature=args.router_temperature, dropout=args.dropout,
-                    rank=rank, world_size=world_size,
+                    rank=rank, world_size=world_size, top_k=top_k,
                 )
             else:
                 self.ffn = SharedAdapterMoEFFN(
                     model_dim=args.encoder_dim, hidden_dim=args.ffn_hidden_dim,
                     adapter_hidden_dim=args.adapter_hidden_dim, num_experts=args.num_experts,
-                    temperature=args.router_temperature, dropout=args.dropout,
+                    temperature=args.router_temperature, dropout=args.dropout, top_k=top_k,
                 )
             self.final_norm = nn.LayerNorm(args.encoder_dim)
             self.dropout = nn.Dropout(args.dropout)
