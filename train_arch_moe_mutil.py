@@ -1598,6 +1598,12 @@ def main() -> None:
                     f"world_size {world_size} for Expert Parallelism. "
                     f"Use --no-expert-parallel or adjust --num-experts."
                 )
+            # Layer drop causes collective mismatches in EP mode
+            # (different ranks drop different blocks → different dist calls)
+            if float(getattr(args, "layer_drop", 0.0)) > 0:
+                args.layer_drop = 0.0
+                if is_main:
+                    print("layer_drop forced to 0 in Expert Parallel mode.", flush=True)
             if is_main:
                 print(f"Expert Parallel: {world_size} GPUs × "
                       f"{args.num_experts // world_size} local experts "
