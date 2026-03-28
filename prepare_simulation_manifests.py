@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 
-DEFAULT_VARIANTS = ("clean", "speed_0.9", "speed_1.1", "noise_0.005")
+DEFAULT_VARIANTS = ("clean",)
 AUTO = "auto"
 
 

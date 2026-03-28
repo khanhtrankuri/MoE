@@ -882,7 +882,7 @@ class CachedFeatureDataset(Dataset):
     def _load_record(self, record: dict[str, Any], *, device: str | None = None) -> dict[str, Any]:
         sample = torch.load(self._resolve_feature_path(record), map_location="cpu")
         token_ids = sample["target_ids"].to(dtype=torch.long).contiguous()
-        features = sample["features"].contiguous()
+        features = sample["features"].to(dtype=torch.float32).contiguous()
         if device is not None:
             features = features.to(device)
             token_ids = token_ids.to(device)
