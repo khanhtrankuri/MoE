@@ -1426,6 +1426,8 @@ def train_one_epoch(
                     "global_step": (epoch - 1) * len(loader) + step, "epoch": epoch,
                     "train/loss_step": rl / max(1, rtw), "train/lr": lr_,
                 })
+        if device.startswith("cuda") and world_size > 1 and getattr(args, "expert_parallel", True):
+            torch.cuda.empty_cache()
         t_end = time.perf_counter()
 
     # ── Reduce metrics across ranks ──
@@ -1565,6 +1567,11 @@ def main() -> None:
     world_size  = int(os.environ.get("WORLD_SIZE", 1))
     is_main     = rank == 0
     use_ep      = bool(getattr(args, "expert_parallel", True)) and world_size > 1
+
+    if torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        if is_main:
+            print("PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", flush=True)
 
     if world_size > 1:
         # Select backend: nccl is fastest on GPU clusters; gloo works on Kaggle/sandboxed envs
