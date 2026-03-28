@@ -267,18 +267,10 @@ def _reduce_non_expert_gradients(model: nn.Module, world_size: int) -> None:
         # e.g. "blocks.2.ffn.trunks.0.0.weight" → parts contain "trunks"
         if any(part in _EP_EXPERT_SUBMODULES for part in name.split(".")):
             continue  # expert param – stays local
-        grad_present = torch.tensor(
-            0 if param.grad is None else 1,
-            dtype=torch.int64,
-            device=param.device,
-        )
-        dist.all_reduce(grad_present, op=dist.ReduceOp.SUM)
-        if int(grad_present.item()) == 0:
-            continue
-        if param.grad is None:
-            param.grad = torch.zeros_like(param)
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-        param.grad.div_(world_size)
+        grad = param.grad if param.grad is not None else torch.zeros_like(param)
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+        grad.div_(world_size)
+        param.grad = grad
 
 
 def _sync_batchnorm_buffers(model: nn.Module, world_size: int) -> None:
@@ -298,6 +290,19 @@ def _sync_batchnorm_buffers(model: nn.Module, world_size: int) -> None:
             module.running_var.div_(world_size)
         if module.num_batches_tracked is not None:
             dist.all_reduce(module.num_batches_tracked, op=dist.ReduceOp.MAX)
+
+
+def _should_drop_layer(layer_drop: float, training: bool, device: str | torch.device) -> bool:
+    """Synchronize stochastic layer-drop decisions across ranks."""
+    if not training or layer_drop <= 0:
+        return False
+    if not _dist_active():
+        return random.random() < layer_drop
+    drop_flag = torch.zeros((), dtype=torch.int64, device=device)
+    if dist.get_rank() == 0 and random.random() < layer_drop:
+        drop_flag.fill_(1)
+    dist.broadcast(drop_flag, src=0)
+    return bool(drop_flag.item())
 
 
 # ===========================================================================
@@ -883,7 +888,7 @@ if TORCH_IMPORT_ERROR is None:
                 )
 
         def forward(self, h, mask, pos_enc, forced_expert=None, return_all_experts=False):
-            if self.training and self.layer_drop > 0 and random.random() < self.layer_drop:
+            if _should_drop_layer(self.layer_drop, self.training, h.device):
                 return h, None, None
             kpm = ~mask.bool()
             attn_in = self.self_attn_norm(h)
@@ -939,7 +944,7 @@ if TORCH_IMPORT_ERROR is None:
             self.dropout = nn.Dropout(args.dropout)
 
         def forward(self, h, mask, pos_enc, forced_expert=None, return_all_experts=False):
-            if self.training and self.layer_drop > 0 and random.random() < self.layer_drop:
+            if _should_drop_layer(self.layer_drop, self.training, h.device):
                 return h, None, None
             mac_out, _, _ = self.macaron_ffn(self.macaron_norm(h), mask.float())
             h = h + 0.5 * self.dropout(mac_out)
