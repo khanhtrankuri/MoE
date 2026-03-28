@@ -215,6 +215,41 @@ def _all_reduce_tensor(t: torch.Tensor, device: str) -> torch.Tensor:
     return buf.cpu()
 
 
+def _sync_batch_time_dims(batch_size: int, time_steps: int, device: str | torch.device) -> tuple[int, int]:
+    """Return the max batch/time dimensions across the process group."""
+    if not _dist_active():
+        return batch_size, time_steps
+    dims = torch.tensor([batch_size, time_steps], dtype=torch.long, device=device)
+    dist.all_reduce(dims, op=dist.ReduceOp.MAX)
+    return int(dims[0].item()), int(dims[1].item())
+
+
+def _pad_batch_time_dims(
+    tensor: torch.Tensor,
+    target_batch: int,
+    target_time: int,
+) -> torch.Tensor:
+    """Pad a (B, T, D) or (E, B, T, D) tensor up to a shared batch/time shape."""
+    if tensor.dim() == 3:
+        batch_size, time_steps = int(tensor.shape[0]), int(tensor.shape[1])
+    elif tensor.dim() == 4:
+        batch_size, time_steps = int(tensor.shape[1]), int(tensor.shape[2])
+    else:
+        raise ValueError(f"Expected a 3-D or 4-D tensor, got shape {tuple(tensor.shape)}")
+
+    if target_batch < batch_size or target_time < time_steps:
+        raise ValueError(
+            f"Cannot pad tensor with shape {tuple(tensor.shape)} to smaller target "
+            f"({target_batch}, {target_time})."
+        )
+
+    if target_time > time_steps:
+        tensor = F.pad(tensor, (0, 0, 0, target_time - time_steps))
+    if target_batch > batch_size:
+        tensor = F.pad(tensor, (0, 0, 0, 0, 0, target_batch - batch_size))
+    return tensor.contiguous()
+
+
 # Names of parameter sub-modules that belong to experts (not shared).
 # Used to skip all_reduce for these params during EP gradient reduction.
 _EP_EXPERT_SUBMODULES = {"trunks", "share_down", "adapter_up", "adapter_down"}
@@ -229,13 +264,40 @@ def _reduce_non_expert_gradients(model: nn.Module, world_size: int) -> None:
     if world_size <= 1:
         return
     for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
         # e.g. "blocks.2.ffn.trunks.0.0.weight" → parts contain "trunks"
         if any(part in _EP_EXPERT_SUBMODULES for part in name.split(".")):
             continue  # expert param – stays local
+        grad_present = torch.tensor(
+            0 if param.grad is None else 1,
+            dtype=torch.int64,
+            device=param.device,
+        )
+        dist.all_reduce(grad_present, op=dist.ReduceOp.SUM)
+        if int(grad_present.item()) == 0:
+            continue
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
         param.grad.div_(world_size)
+
+
+def _sync_batchnorm_buffers(model: nn.Module, world_size: int) -> None:
+    """Keep BatchNorm running stats aligned in EP mode without SyncBatchNorm."""
+    if world_size <= 1:
+        return
+    for module in model.modules():
+        if not isinstance(module, nn.modules.batchnorm._BatchNorm):
+            continue
+        if not module.track_running_stats:
+            continue
+        if module.running_mean is not None:
+            dist.all_reduce(module.running_mean, op=dist.ReduceOp.SUM)
+            module.running_mean.div_(world_size)
+        if module.running_var is not None:
+            dist.all_reduce(module.running_var, op=dist.ReduceOp.SUM)
+            module.running_var.div_(world_size)
+        if module.num_batches_tracked is not None:
+            dist.all_reduce(module.num_batches_tracked, op=dist.ReduceOp.MAX)
 
 
 # ===========================================================================
@@ -247,8 +309,9 @@ class _AllGatherGrad(torch.autograd.Function):
 
     Forward : concatenates local_tensor (local_E, B, T, D) from every rank
               into (num_experts, B, T, D) on each rank.
-    Backward: slices the gradient to the local rank's portion; no inter-rank
-              communication needed because gradients only flow to local experts.
+    Backward: slices the local-expert gradient, pads it back to the gathered
+              shape, and all_reduces it so each expert receives contributions
+              from every rank's local loss.
     """
 
     @staticmethod
@@ -256,6 +319,8 @@ class _AllGatherGrad(torch.autograd.Function):
         ctx.world_size = world_size
         ctx.rank = rank
         ctx.local_size = local_tensor.shape[0]
+        ctx.input_batch = local_tensor.shape[1]
+        ctx.input_time = local_tensor.shape[2]
         gather_list = [torch.zeros_like(local_tensor) for _ in range(world_size)]
         dist.all_gather(gather_list, local_tensor.contiguous())
         return torch.cat(gather_list, dim=0)  # (num_experts, B, T, D)
@@ -264,8 +329,10 @@ class _AllGatherGrad(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
         rank = ctx.rank
         local_size = ctx.local_size
-        # Only this rank's slice of the gradient flows back to local experts
         local_grad = grad_output[rank * local_size:(rank + 1) * local_size].contiguous()
+        local_grad = _pad_batch_time_dims(local_grad, ctx.input_batch, ctx.input_time)
+        if ctx.world_size > 1:
+            dist.all_reduce(local_grad, op=dist.ReduceOp.SUM)
         return local_grad, None, None
 
 
@@ -657,7 +724,10 @@ if TORCH_IMPORT_ERROR is None:
                 else:
                     output = torch.zeros_like(hidden_states)
                 if self.world_size > 1:
+                    target_B, target_T = _sync_batch_time_dims(B, T, hidden_states.device)
+                    output = _pad_batch_time_dims(output, target_B, target_T)
                     dist.all_reduce(output, op=dist.ReduceOp.SUM)
+                    output = output[:B, :T, :]  # trim back
                 fg = torch.zeros_like(gates_sent); fg[:, forced_expert] = 1.0
                 return output, fg, {"pooled": pooled, "router_gates": gates_sent}
 
@@ -679,8 +749,13 @@ if TORCH_IMPORT_ERROR is None:
             )
 
             # Step 2: differentiable all_gather → (num_experts, B, T, D)
+            # Each rank may have different batch/time shapes. Synchronize the
+            # max shape across ranks, pad before gather, and trim after.
             if self.world_size > 1:
+                target_B, target_T = _sync_batch_time_dims(B, T, hidden_states.device)
+                local_outputs = _pad_batch_time_dims(local_outputs, target_B, target_T)
                 all_outputs = _AllGatherGrad.apply(local_outputs, self.world_size, self.rank)
+                all_outputs = all_outputs[:, :B, :T, :]  # trim back to local batch/time
             else:
                 all_outputs = local_outputs
 
@@ -1315,6 +1390,8 @@ def train_one_epoch(
             else:
                 gn = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
                 optimizer.step()
+            if world_size > 1 and getattr(args, "expert_parallel", True):
+                _sync_batchnorm_buffers(model, world_size)
             if scheduler is not None: scheduler.step()
         synchronize_for_timing(device, prof)
         timing["optimizer"] += time.perf_counter() - t0
@@ -1620,12 +1697,14 @@ def main() -> None:
         elif use_ep:
             # EP mode: NO DDP wrapper.  Gradient reduction is done manually in
             # train_one_epoch via _reduce_non_expert_gradients().
-            # SyncBatchNorm for the Conformer conv module.
-            if args.encoder_type == "conformer":
-                model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-                raw_model = model  # SyncBatchNorm.convert returns the same module
             if is_main:
                 print("Model in Expert Parallel mode (manual gradient reduction).", flush=True)
+                if args.encoder_type == "conformer":
+                    print(
+                        "Conformer EP keeps BatchNorm1d local during forward; "
+                        "running stats are averaged after optimizer steps.",
+                        flush=True,
+                    )
 
         if is_main:
             total_params = sum(p.numel() for p in raw_model.parameters())
