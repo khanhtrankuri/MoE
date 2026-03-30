@@ -35,6 +35,7 @@ from train_dme_sim import (
     configure_runtime,
     create_grad_scaler,
     dataset_storage_device,
+    DynamicBatchSampler,
     ensure_torch,
     finish_wandb_run,
     flatten_routing_metrics,
@@ -44,9 +45,11 @@ from train_dme_sim import (
     load_jsonl,
     log_wandb_metrics,
     move_batch_to_device,
+    ModelEMA,
     normalize_eval_text,
     prepare_output_dir,
     resolve_loader_kwargs,
+    resolve_dataset_length_hints,
     resolve_training_tokenizer,
     save_json,
     select_hypotheses,
@@ -55,6 +58,25 @@ from train_dme_sim import (
     summarize_routing,
     synchronize_for_timing,
 )
+
+
+# ===========================================================================
+# AMP dtype helper
+# ===========================================================================
+
+def resolve_autocast_dtype(device: str) -> torch.dtype:
+    """Pick the best autocast dtype for *device*.
+
+    bf16 requires compute capability >= 8.0 (Ampere+).
+    Falls back to fp16 on older CUDA GPUs, bf16 on CPU.
+    """
+    if not device.startswith("cuda"):
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability[0] >= 8:
+            return torch.bfloat16
+    return torch.float16
 
 
 def parse_args() -> argparse.Namespace:
@@ -180,6 +202,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size.")
+    parser.add_argument(
+        "--max-tokens-per-batch",
+        type=int,
+        default=0,
+        help="If > 0, use dynamic batching so the sum of feature frames per batch stays under this limit.",
+    )
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=4, help="DataLoader prefetch factor.")
     add_data_pipeline_args(parser)
@@ -324,6 +352,18 @@ def parse_args() -> argparse.Namespace:
         help="Stop if no validation CER improvement for N eval rounds (0 disables).",
     )
     parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.0,
+        help="If > 0, maintain an exponential moving average copy of the model for eval/checkpoints.",
+    )
+    parser.add_argument(
+        "--ema-start-epoch",
+        type=int,
+        default=1,
+        help="Start updating EMA from this epoch onward.",
+    )
+    parser.add_argument(
         "--wandb-project",
         default="moe-asr",
         help="Weights & Biases project name. Leave unset to disable wandb logging.",
@@ -364,6 +404,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Encoder layer index for intermediate CTC loss. 0 = auto (middle layer).",
+    )
+    parser.add_argument(
+        "--gradient-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable gradient checkpointing to reduce GPU memory at the cost of extra compute.",
+    )
+    parser.add_argument(
+        "--expert-merge-noise",
+        type=float,
+        default=0.01,
+        help="Gaussian noise scale injected into child expert after merge (relative to param std).",
+    )
+    parser.add_argument(
+        "--expert-diversity-threshold",
+        type=float,
+        default=0.0,
+        help="If mean cosine similarity between experts > threshold, skip merge and log warning.",
     )
     parser.set_defaults(tokenizer_type="grapheme")
     add_profiling_args(parser)
@@ -846,6 +904,7 @@ if TORCH_IMPORT_ERROR is None:
         def __init__(self, args: argparse.Namespace, vocab_size: int):
             super().__init__()
             self.num_experts = int(args.num_experts)
+            self.gradient_checkpoint = bool(getattr(args, "gradient_checkpoint", False))
             self.ffn_type = args.ffn_type
             self.subsampling = Conv2dSubsampling(args.n_mels, args.encoder_dim, args.dropout)
             self.position = RelativePositionalEncoding(args.encoder_dim, dropout=args.dropout)
@@ -892,13 +951,19 @@ if TORCH_IMPORT_ERROR is None:
                 block_forced_expert = forced_expert
                 if forced_experts is not None:
                     block_forced_expert = forced_experts.get(block_idx)
-                hidden_states, routing, aux = block(
-                    hidden_states,
-                    mask,
-                    pos_enc,
-                    forced_expert=block_forced_expert,
-                    return_all_experts=return_aux,
-                )
+                if self.gradient_checkpoint and self.training and block_forced_expert is None and not return_aux:
+                    hidden_states, routing, aux = torch.utils.checkpoint.checkpoint(
+                        block, hidden_states, mask, pos_enc, block_forced_expert, return_aux,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states, routing, aux = block(
+                        hidden_states,
+                        mask,
+                        pos_enc,
+                        forced_expert=block_forced_expert,
+                        return_all_experts=return_aux,
+                    )
                 if routing is not None:
                     routing_values.append(routing)
                 if return_aux:
@@ -1018,7 +1083,7 @@ def compute_expert_scores(
 
     scores = []
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-    autocast_dtype = torch.float16 if autocast_device == "cuda" else torch.bfloat16
+    autocast_dtype = resolve_autocast_dtype(autocast_device)
 
     for expert_idx in range(args.num_experts):
         forward_kwargs: dict[str, Any] = {"return_aux": False}
@@ -1218,6 +1283,37 @@ def should_run_expert_evolution(args: argparse.Namespace, epoch: int) -> bool:
     return epoch % args.expert_evolve_every_epochs == 0
 
 
+@torch.no_grad()
+def compute_expert_diversity(moe_module: SharedAdapterMoEFFN) -> dict[str, float]:
+    """Compute pairwise cosine similarity between experts to detect collapse."""
+    expert_vecs: list[torch.Tensor] = []
+    for i in range(moe_module.num_experts):
+        params: list[torch.Tensor] = []
+        for p in moe_module.trunks[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.share_down[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.adapter_up[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.adapter_down[i].parameters():
+            params.append(p.detach().reshape(-1))
+        expert_vecs.append(torch.cat(params))
+
+    if len(expert_vecs) < 2:
+        return {"mean_cosine_sim": 0.0, "min_cosine_sim": 0.0, "max_cosine_sim": 0.0}
+
+    sims: list[float] = []
+    for i in range(len(expert_vecs)):
+        for j in range(i + 1, len(expert_vecs)):
+            sim = float(F.cosine_similarity(expert_vecs[i].unsqueeze(0), expert_vecs[j].unsqueeze(0)).item())
+            sims.append(sim)
+    return {
+        "mean_cosine_sim": sum(sims) / len(sims),
+        "min_cosine_sim": min(sims),
+        "max_cosine_sim": max(sims),
+    }
+
+
 def flatten_scalar_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     payload: dict[str, float] = {}
     for raw_key, value in metrics.items():
@@ -1282,7 +1378,7 @@ def evaluate(
     domain_loss_count: dict[str, int] = defaultdict(int)
     expert_fitness_storage: list[torch.Tensor] = []
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-    autocast_dtype = torch.float16 if autocast_device == "cuda" else torch.bfloat16
+    autocast_dtype = resolve_autocast_dtype(autocast_device)
     effective_comp_weight = get_effective_competition_weight(args, epoch)
 
     iterator = build_progress(loader, total=len(loader), desc=stage, leave=False)
@@ -1404,6 +1500,8 @@ def train_one_epoch(
     scaler=None,
     use_amp: bool = False,
     scheduler=None,
+    ema: ModelEMA | None = None,
+    ema_source_model: nn.Module | None = None,
 ) -> dict[str, Any]:
     del tokenizer
     model.train()
@@ -1420,9 +1518,10 @@ def train_one_epoch(
     running_gate_count = 0
     running_total_weight = 0
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-    autocast_dtype = torch.float16 if autocast_device == "cuda" else torch.bfloat16
+    autocast_dtype = resolve_autocast_dtype(autocast_device)
     iterator = build_progress(loader, total=len(loader), desc=f"train e{epoch}", leave=False)
     profile_enabled = bool(getattr(args, "profile_performance", False))
+    dynamic_batching = int(getattr(args, "max_tokens_per_batch", 0)) > 0
     effective_comp_weight = get_effective_competition_weight(args, epoch)
     timing_sums = {
         "data": 0.0,
@@ -1454,6 +1553,14 @@ def train_one_epoch(
         timing_sums["transfer"] += transfer_time
         if profile_enabled and step == 1:
             print(f"epoch={epoch} first batch moved to device in {transfer_time:.4f}s", flush=True)
+        if profile_enabled and dynamic_batching:
+            total_frames = int(batch["input_lengths"].sum().item())
+            max_frames = int(batch["input_lengths"].max().item())
+            print(
+                f"epoch={epoch} step={step}/{len(loader)} dynamic_batch "
+                f"size={int(batch['input_lengths'].numel())} total_frames={total_frames} max_frames={max_frames}",
+                flush=True,
+            )
 
         if (step - 1) % accum_steps == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -1544,17 +1651,22 @@ def train_one_epoch(
 
         optimizer_start = time.perf_counter()
         grad_norm = 0.0
+        did_step = False
         if step % accum_steps == 0 or step == len(loader):
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
                 grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
                 scaler.step(optimizer)
                 scaler.update()
+                did_step = True
             else:
                 grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
                 optimizer.step()
+                did_step = True
             if scheduler is not None:
                 scheduler.step()
+            if did_step and ema is not None and ema_source_model is not None and epoch >= int(getattr(args, "ema_start_epoch", 1)):
+                ema.update(ema_source_model)
         synchronize_for_timing(device, profile_enabled)
         optimizer_time = time.perf_counter() - optimizer_start
         timing_sums["optimizer"] += optimizer_time
@@ -1687,7 +1799,7 @@ def collect_evolution_statistics(
 
     max_batches = args.competition_batches if args.competition_batches > 0 else len(loader)
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-    autocast_dtype = torch.float16 if autocast_device == "cuda" else torch.bfloat16
+    autocast_dtype = resolve_autocast_dtype(autocast_device)
 
     model.eval()
     iterator = build_progress(loader, total=min(len(loader), max_batches), desc="evolve stats", leave=False)
@@ -1882,37 +1994,94 @@ def main() -> None:
             f"loader={loader_kwargs}",
             flush=True,
         )
-
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-            **loader_kwargs,
-        )
-        valid_loader = torch.utils.data.DataLoader(
-            valid_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            **loader_kwargs,
-        )
-        test_loader = (
-            torch.utils.data.DataLoader(
-                test_dataset,
+        max_tokens_per_batch = max(0, int(getattr(args, "max_tokens_per_batch", 0)))
+        if max_tokens_per_batch > 0:
+            train_batch_sampler = DynamicBatchSampler(
+                resolve_dataset_length_hints(train_dataset, args),
+                max_tokens_per_batch,
+                shuffle=True,
+                seed=args.seed,
+            )
+            valid_batch_sampler = DynamicBatchSampler(
+                resolve_dataset_length_hints(valid_dataset, args),
+                max_tokens_per_batch,
+                shuffle=False,
+                seed=args.seed,
+            )
+            test_batch_sampler = (
+                DynamicBatchSampler(
+                    resolve_dataset_length_hints(test_dataset, args),
+                    max_tokens_per_batch,
+                    shuffle=False,
+                    seed=args.seed,
+                )
+                if test_dataset
+                else None
+            )
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_sampler=train_batch_sampler,
+                collate_fn=collate_fn,
+                **loader_kwargs,
+            )
+            valid_loader = torch.utils.data.DataLoader(
+                valid_dataset,
+                batch_sampler=valid_batch_sampler,
+                collate_fn=collate_fn,
+                **loader_kwargs,
+            )
+            test_loader = (
+                torch.utils.data.DataLoader(
+                    test_dataset,
+                    batch_sampler=test_batch_sampler,
+                    collate_fn=collate_fn,
+                    **loader_kwargs,
+                )
+                if test_dataset and test_batch_sampler is not None
+                else None
+            )
+            print(
+                f"Dynamic batching enabled: max_tokens_per_batch={max_tokens_per_batch} "
+                f"train_batches={len(train_loader)} valid_batches={len(valid_loader)}",
+                flush=True,
+            )
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=collate_fn,
+                **loader_kwargs,
+            )
+            valid_loader = torch.utils.data.DataLoader(
+                valid_dataset,
                 batch_size=args.batch_size,
                 shuffle=False,
                 collate_fn=collate_fn,
                 **loader_kwargs,
             )
-            if test_dataset
-            else None
-        )
+            test_loader = (
+                torch.utils.data.DataLoader(
+                    test_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    **loader_kwargs,
+                )
+                if test_dataset
+                else None
+            )
 
         model = EncoderMoECTCModel(args, vocab_size=len(tokenizer.id_to_token)).to(device)
         raw_model = model
         if n_gpus > 1:
             model = nn.DataParallel(model)
+        ema = ModelEMA(raw_model, decay=args.ema_decay) if float(getattr(args, "ema_decay", 0.0)) > 0.0 else None
+        if ema is not None:
+            print(
+                f"EMA enabled: decay={float(args.ema_decay):.6f} start_epoch={int(args.ema_start_epoch)}",
+                flush=True,
+            )
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = build_lr_scheduler(optimizer, args, len(train_loader))
         ctc_loss = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True, reduction="mean")
@@ -1945,6 +2114,8 @@ def main() -> None:
                 scaler=scaler,
                 use_amp=use_amp,
                 scheduler=scheduler,
+                ema=ema,
+                ema_source_model=raw_model,
             )
 
             # Anneal router temperature
@@ -2003,8 +2174,9 @@ def main() -> None:
                 log_wandb_metrics(wandb_run, train_log_payload)
                 continue
 
+            eval_model = ema.ema_model if ema is not None and ema.ready else model
             valid_metrics = evaluate(
-                model=model,
+                model=eval_model,
                 loader=valid_loader,
                 tokenizer=tokenizer,
                 ctc_loss=ctc_loss,
@@ -2114,6 +2286,7 @@ def main() -> None:
                         "config": vars(args),
                         "vocab": tokenizer.id_to_token,
                         "best_valid_cer": best_valid_cer,
+                        "ema_model_state": ema.state_dict() if ema is not None else None,
                     },
                     output_dir / "best.pt",
                 )
@@ -2141,8 +2314,11 @@ def main() -> None:
         if test_loader is not None and (output_dir / "best.pt").exists():
             checkpoint = torch.load(output_dir / "best.pt", map_location=device)
             raw_model.load_state_dict(checkpoint["model_state"])
+            if ema is not None and checkpoint.get("ema_model_state") is not None:
+                ema.load_state_dict(checkpoint["ema_model_state"])
+            test_eval_model = ema.ema_model if ema is not None and ema.ready else model
             test_metrics = evaluate(
-                model=model,
+                model=test_eval_model,
                 loader=test_loader,
                 tokenizer=tokenizer,
                 ctc_loss=ctc_loss,

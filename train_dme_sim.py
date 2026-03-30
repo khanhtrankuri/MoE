@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -11,7 +12,7 @@ import time
 import wave
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 try:
     from tqdm.auto import tqdm
@@ -27,7 +28,7 @@ try:
         pad_sequence,
         pack_padded_sequence,
     )
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, Sampler
 
     TORCH_IMPORT_ERROR = None
 except ImportError as exc:
@@ -39,6 +40,7 @@ except ImportError as exc:
     pack_padded_sequence = None
     DataLoader = None
     Dataset = object
+    Sampler = object
     TORCH_IMPORT_ERROR = exc
 
 from text_utils import normalize_transcript, split_graphemes
@@ -829,6 +831,13 @@ class SpeechSimulationDataset(Dataset):
                     "text": text,
                     "domain": item.get("simulation_domain", "clean"),
                     "token_ids": token_ids,
+                    "source_duration_seconds": float(item.get("source_duration_seconds", 0.0)),
+                    "processed_duration_seconds": float(
+                        item.get("processed_duration_seconds", item.get("duration_seconds", 0.0))
+                    ),
+                    "duration_seconds": float(item.get("duration_seconds", item.get("processed_duration_seconds", 0.0))),
+                    "estimated_dense_ctc_steps": int(item.get("estimated_dense_ctc_steps", 0)),
+                    "estimated_ctc_steps": int(item.get("estimated_ctc_steps", 0)),
                 }
             )
 
@@ -928,6 +937,180 @@ class CachedFeatureDataset(Dataset):
             return self._samples[index]
         return self._load_record(self.records[index], device=None)
 
+
+def estimate_feature_frames_from_seconds(
+    duration_seconds: float,
+    *,
+    sample_rate: int,
+    hop_length: int,
+    win_length: int,
+    max_audio_seconds: float = 0.0,
+) -> int:
+    seconds = max(0.0, float(duration_seconds))
+    if max_audio_seconds > 0:
+        seconds = min(seconds, float(max_audio_seconds))
+    num_samples = max(1, int(round(seconds * sample_rate)))
+    if num_samples <= win_length:
+        return 1
+    return 1 + max(0, (num_samples - win_length) // max(1, hop_length))
+
+
+def resolve_dataset_length_hints(dataset, args) -> list[int]:
+    max_audio_seconds = float(getattr(args, "max_audio_seconds", 0.0))
+    sample_rate = int(getattr(args, "sample_rate", 1))
+    hop_length = int(getattr(args, "hop_length", 1))
+    win_length = int(getattr(args, "win_length", hop_length))
+
+    cached_samples = getattr(dataset, "_samples", None)
+    if cached_samples is not None:
+        return [max(1, int(sample.get("feature_length", 1))) for sample in cached_samples]
+
+    records = getattr(dataset, "records", None)
+    if records is None:
+        return [1] * len(dataset)
+
+    lengths: list[int] = []
+    for record in records:
+        length = 0
+        for key in ("feature_length", "estimated_dense_ctc_steps", "estimated_ctc_steps", "input_length"):
+            raw_value = record.get(key)
+            if raw_value is None:
+                continue
+            length = int(raw_value)
+            if length > 0:
+                break
+        if length <= 0:
+            seconds = float(
+                record.get(
+                    "processed_duration_seconds",
+                    record.get("duration_seconds", record.get("source_duration_seconds", 0.0)),
+                )
+            )
+            length = estimate_feature_frames_from_seconds(
+                seconds,
+                sample_rate=sample_rate,
+                hop_length=hop_length,
+                win_length=win_length,
+                max_audio_seconds=max_audio_seconds,
+            )
+        lengths.append(max(1, length))
+    return lengths
+
+
+class DynamicBatchSampler(Sampler):
+    """Length-aware batch sampler with optional distributed batch partitioning."""
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        max_tokens: int,
+        *,
+        shuffle: bool = True,
+        seed: int = 0,
+        num_replicas: int = 1,
+        rank: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be > 0, got {max_tokens}")
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be > 0, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        self.lengths = [max(1, int(length)) for length in lengths]
+        self.max_tokens = int(max_tokens)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+        self._global_batches = self._build_global_batches()
+
+    def _build_global_batches(self) -> list[list[int]]:
+        if not self.lengths:
+            return []
+        ordered_indices = sorted(range(len(self.lengths)), key=lambda idx: (self.lengths[idx], idx))
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_tokens = 0
+        for idx in ordered_indices:
+            sample_tokens = self.lengths[idx]
+            exceeds_limit = current_batch and (current_tokens + sample_tokens > self.max_tokens)
+            if exceeds_limit:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(idx)
+            current_tokens += sample_tokens
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _get_rank_batches(self) -> list[list[int]]:
+        batches = [list(batch) for batch in self._global_batches]
+        if self.shuffle and len(batches) > 1:
+            rng = random.Random(self.seed + self.epoch)
+            rng.shuffle(batches)
+        if self.num_replicas == 1:
+            return batches
+        if not batches:
+            return []
+        remainder = len(batches) % self.num_replicas
+        if remainder != 0:
+            if self.drop_last:
+                batches = batches[: len(batches) - remainder]
+            else:
+                pad = self.num_replicas - remainder
+                for idx in range(pad):
+                    batches.append(list(batches[idx % len(batches)]))
+        return batches[self.rank::self.num_replicas]
+
+    def __iter__(self):
+        yield from self._get_rank_batches()
+
+    def __len__(self) -> int:
+        if self.num_replicas == 1:
+            return len(self._global_batches)
+        if self.drop_last:
+            return len(self._global_batches) // self.num_replicas
+        return (len(self._global_batches) + self.num_replicas - 1) // self.num_replicas
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+        self.ema_model.requires_grad_(False)
+        self.decay = float(decay)
+        self.num_updates = 0
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            self.num_updates += 1
+            for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
+                ema_param.data.mul_(self.decay).add_(model_param.data, alpha=1.0 - self.decay)
+            for ema_buffer, model_buffer in zip(self.ema_model.buffers(), model.buffers()):
+                ema_buffer.copy_(model_buffer)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "model_state": self.ema_model.state_dict(),
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.ema_model.load_state_dict(state_dict["model_state"])
+        self.decay = float(state_dict.get("decay", self.decay))
+        self.num_updates = int(state_dict.get("num_updates", 0))
+
+    @property
+    def ready(self) -> bool:
+        return self.num_updates > 0
 
 def build_raw_collate_fn(args, tokenizer: CharTokenizer):
     extractor = LogMelExtractor(

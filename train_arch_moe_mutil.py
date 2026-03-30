@@ -58,6 +58,7 @@ from train_dme_sim import (
     configure_runtime,
     create_grad_scaler,
     dataset_storage_device,
+    DynamicBatchSampler,
     ensure_torch,
     finish_wandb_run,
     flatten_routing_metrics,
@@ -67,9 +68,11 @@ from train_dme_sim import (
     load_jsonl,
     log_wandb_metrics,
     move_batch_to_device,
+    ModelEMA,
     normalize_eval_text,
     prepare_output_dir,
     resolve_loader_kwargs,
+    resolve_dataset_length_hints,
     resolve_training_tokenizer,
     save_json,
     select_hypotheses,
@@ -133,6 +136,12 @@ def parse_args() -> argparse.Namespace:
     # ── Training ─────────────────────────────────────────────────────────
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument(
+        "--max-tokens-per-batch",
+        type=int,
+        default=0,
+        help="If > 0, use dynamic batching so the sum of feature frames per batch stays under this limit.",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     add_data_pipeline_args(parser)
@@ -143,7 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr-scale", type=float, default=0.1)
-    parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--entropy-bonus-weight", type=float, default=0.0)
     parser.add_argument("--temperature-anneal-start", type=float, default=None)
     parser.add_argument("--temperature-anneal-end", type=float, default=None)
@@ -177,6 +186,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tf32", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--eval-every-epochs", type=int, default=1)
     parser.add_argument("--early-stop-patience", type=int, default=0)
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.0,
+        help="If > 0, maintain an exponential moving average copy of the model for eval/checkpoints.",
+    )
+    parser.add_argument(
+        "--ema-start-epoch",
+        type=int,
+        default=1,
+        help="Start updating EMA from this epoch onward.",
+    )
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint (.pt) to resume training from.")
     parser.add_argument("--wandb-project", default="moe-asr")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default="arch-casamoe-ep")
@@ -186,9 +209,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer-drop", type=float, default=0.1)
     parser.add_argument("--intermediate-ctc-weight", type=float, default=0.3)
     parser.add_argument("--intermediate-ctc-layer", type=int, default=0)
+    parser.add_argument("--gradient-checkpoint", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable gradient checkpointing to reduce GPU memory at the cost of extra compute.")
+    parser.add_argument("--expert-merge-noise", type=float, default=0.01,
+                        help="Gaussian noise scale injected into child expert after merge (relative to param std).")
+    parser.add_argument("--expert-diversity-threshold", type=float, default=0.0,
+                        help="If mean cosine similarity between experts > threshold, skip merge and log warning.")
     parser.set_defaults(tokenizer_type="grapheme")
     add_profiling_args(parser)
     return parser.parse_args()
+
+
+# ===========================================================================
+# AMP dtype helper
+# ===========================================================================
+
+def resolve_autocast_dtype(device: str) -> torch.dtype:
+    """Pick the best autocast dtype for *device*.
+
+    bf16 requires compute capability >= 8.0 (Ampere+).
+    Falls back to fp16 on older CUDA GPUs, bf16 on CPU.
+    """
+    if not device.startswith("cuda"):
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability[0] >= 8:
+            return torch.bfloat16
+    return torch.float16
 
 
 # ===========================================================================
@@ -255,18 +303,36 @@ def _pad_batch_time_dims(
 _EP_EXPERT_SUBMODULES = {"trunks", "share_down", "adapter_up", "adapter_down"}
 
 
-def _reduce_non_expert_gradients(model: nn.Module, world_size: int) -> None:
+def precompute_shared_params(model: nn.Module) -> list[nn.Parameter]:
+    """Return the list of parameters that are NOT expert-local (shared across ranks).
+
+    Call once at init; the result is reused every step to avoid
+    repeated string matching in ``named_parameters()``.
+    """
+    shared: list[nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not any(part in _EP_EXPERT_SUBMODULES for part in name.split(".")):
+            shared.append(param)
+    return shared
+
+
+def _reduce_non_expert_gradients(model: nn.Module, world_size: int,
+                                  _shared_params: list[nn.Parameter] | None = None) -> None:
     """In Expert Parallel mode we do NOT use DDP.
     Instead, manually all_reduce gradients of every param that is NOT
     an expert weight (router, encoder, CTC head, etc.).
     Expert weights live on exactly one GPU → no reduction needed.
+
+    When *_shared_params* is provided (pre-computed list), skip the
+    expensive ``named_parameters()`` walk.
     """
     if world_size <= 1:
         return
-    for name, param in model.named_parameters():
-        # e.g. "blocks.2.ffn.trunks.0.0.weight" → parts contain "trunks"
-        if any(part in _EP_EXPERT_SUBMODULES for part in name.split(".")):
-            continue  # expert param – stays local
+    params = _shared_params if _shared_params is not None else [
+        p for n, p in model.named_parameters()
+        if not any(part in _EP_EXPERT_SUBMODULES for part in n.split("."))
+    ]
+    for param in params:
         grad = param.grad if param.grad is not None else torch.zeros_like(param)
         dist.all_reduce(grad, op=dist.ReduceOp.SUM)
         grad.div_(world_size)
@@ -961,6 +1027,7 @@ if TORCH_IMPORT_ERROR is None:
             super().__init__()
             self.num_experts = int(args.num_experts)
             self.ffn_type = args.ffn_type
+            self.gradient_checkpoint = bool(getattr(args, "gradient_checkpoint", False))
             self.subsampling = Conv2dSubsampling(args.n_mels, args.encoder_dim, args.dropout)
             self.position = RelativePositionalEncoding(args.encoder_dim, dropout=args.dropout)
             block_cls = TransformerMoEBlock if args.encoder_type == "transformer" else ConformerMoEBlock
@@ -988,7 +1055,13 @@ if TORCH_IMPORT_ERROR is None:
             inter_log_probs = None
             for bi, block in enumerate(self.blocks):
                 fe = forced_expert if forced_experts is None else forced_experts.get(bi, forced_expert)
-                h, routing, aux = block(h, mask, pos_enc, forced_expert=fe, return_all_experts=return_aux)
+                if self.gradient_checkpoint and self.training and fe is None and not return_aux:
+                    h, routing, aux = torch.utils.checkpoint.checkpoint(
+                        block, h, mask, pos_enc, fe, return_aux,
+                        use_reentrant=False,
+                    )
+                else:
+                    h, routing, aux = block(h, mask, pos_enc, forced_expert=fe, return_all_experts=return_aux)
                 if routing is not None:
                     routing_vals.append(routing)
                 if return_aux:
@@ -1068,7 +1141,7 @@ def compute_expert_scores(model, batch, ctc_loss, args, device, *, use_amp=False
         return None
     scores = []
     ac_dev = "cuda" if device.startswith("cuda") else "cpu"
-    ac_dtype = torch.float16 if ac_dev == "cuda" else torch.bfloat16
+    ac_dtype = resolve_autocast_dtype(ac_dev)
     for ei in range(args.num_experts):
         fwd_kw: dict = {"return_aux": False}
         if block_idx is None:
@@ -1178,6 +1251,40 @@ def should_run_expert_evolution(args, epoch):
     return epoch % args.expert_evolve_every_epochs == 0
 
 
+@torch.no_grad()
+def compute_expert_diversity(moe_module) -> dict:
+    """Compute pairwise cosine similarity between experts to detect collapse."""
+    expert_vecs = []
+    num_experts = moe_module.num_experts
+    is_ep = isinstance(moe_module, ExpertParallelSharedAdapterMoEFFN)
+    n_local = moe_module.local_num_experts if is_ep else num_experts
+    for i in range(n_local):
+        params = []
+        for p in moe_module.trunks[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.share_down[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.adapter_up[i].parameters():
+            params.append(p.detach().reshape(-1))
+        for p in moe_module.adapter_down[i].parameters():
+            params.append(p.detach().reshape(-1))
+        expert_vecs.append(torch.cat(params))
+
+    if len(expert_vecs) < 2:
+        return {"mean_cosine_sim": 0.0, "min_cosine_sim": 0.0, "max_cosine_sim": 0.0}
+
+    sims = []
+    for i in range(len(expert_vecs)):
+        for j in range(i + 1, len(expert_vecs)):
+            sim = F.cosine_similarity(expert_vecs[i].unsqueeze(0), expert_vecs[j].unsqueeze(0)).item()
+            sims.append(sim)
+    return {
+        "mean_cosine_sim": sum(sims) / len(sims),
+        "min_cosine_sim": min(sims),
+        "max_cosine_sim": max(sims),
+    }
+
+
 def build_lr_scheduler(optimizer, args, steps_per_epoch):
     if args.scheduler == "none": return None
     total = max(1, args.epochs * max(1, steps_per_epoch))
@@ -1221,7 +1328,7 @@ def collect_evolution_statistics(model, loader, ctc_loss, args, device, use_amp=
     }
     max_b = args.competition_batches if args.competition_batches > 0 else len(loader)
     ac_dev = "cuda" if device.startswith("cuda") else "cpu"
-    ac_dtype = torch.float16 if ac_dev == "cuda" else torch.bfloat16
+    ac_dtype = resolve_autocast_dtype(ac_dev)
     model.eval()
     it = build_progress(loader, total=min(len(loader), max_b), desc="evolve stats", leave=False)
     for step, batch in enumerate(it, 1):
@@ -1257,11 +1364,26 @@ def evolve_experts(model, loader, ctc_loss, args, device, use_amp=False) -> list
     ev_stats = collect_evolution_statistics(model, loader, ctc_loss, args, device, use_amp)
     if not ev_stats: return []
 
+    noise_scale = float(getattr(args, "expert_merge_noise", 0.01))
+    diversity_threshold = float(getattr(args, "expert_diversity_threshold", 0.0))
+    rank = dist.get_rank() if _dist_active() else 0
+
     logs = []
     for stats in ev_stats:
         bi = int(stats["block_idx"])
         moe = stats["module"]
         is_ep = isinstance(moe, ExpertParallelSharedAdapterMoEFFN)
+
+        # Check expert diversity before merging
+        diversity = compute_expert_diversity(moe)
+        if diversity_threshold > 0 and diversity["mean_cosine_sim"] > diversity_threshold:
+            if rank == 0:
+                print(f"  [WARN] block={bi}: expert diversity too low "
+                      f"(mean_cosine_sim={diversity['mean_cosine_sim']:.4f} > {diversity_threshold}), "
+                      f"skipping merge.", flush=True)
+            logs.append({"block": bi, "skipped": True, "reason": "diversity_threshold",
+                         "diversity": diversity})
+            continue
 
         pa, pb, pdiag = select_expert_parents(stats["scores"], eps=args.competition_epsilon)
         ri, rdiag = select_replacement_expert(
@@ -1277,10 +1399,25 @@ def evolve_experts(model, loader, ctc_loss, args, device, use_amp=False) -> list
             if moe.owns_expert(ri):
                 moe.merge_experts(sa, sb, ri, alpha=args.expert_merge_alpha,
                                   split_ratio=args.expert_merge_split_ratio)
+                # Inject noise into merged child expert
+                if noise_scale > 0:
+                    li = moe.global_to_local(ri)
+                    for module_list in (moe.trunks[li], moe.share_down[li],
+                                        moe.adapter_up[li], moe.adapter_down[li]):
+                        for p in (module_list.parameters() if hasattr(module_list, 'parameters')
+                                  else [module_list]):
+                            p.data.add_(torch.randn_like(p) * noise_scale * p.data.std().clamp_min(1e-8))
         else:
             moe.merge_experts(pa, pb, child_idx=ri,
                               alpha=args.expert_merge_alpha,
                               split_ratio=args.expert_merge_split_ratio)
+            # Inject noise into merged child expert
+            if noise_scale > 0:
+                for module_list in (moe.trunks[ri], moe.share_down[ri],
+                                    moe.adapter_up[ri], moe.adapter_down[ri]):
+                    for p in (module_list.parameters() if hasattr(module_list, 'parameters')
+                              else [module_list]):
+                        p.data.add_(torch.randn_like(p) * noise_scale * p.data.std().clamp_min(1e-8))
 
         logs.append({
             "block": bi,
@@ -1288,6 +1425,7 @@ def evolve_experts(model, loader, ctc_loss, args, device, use_amp=False) -> list
             "fitness": [round(float(v), 6) for v in stats["fitness"].tolist()],
             "avg_usage": [round(float(v), 6) for v in stats["avg_usage"].tolist()],
             "parent_selection": pdiag, "replacement": rdiag,
+            "diversity": diversity,
         })
     return logs
 
@@ -1299,7 +1437,8 @@ def evolve_experts(model, loader, ctc_loss, args, device, use_amp=False) -> list
 def train_one_epoch(
     model, loader, tokenizer, optimizer, ctc_loss, args, device,
     epoch, wandb_run=None, scaler=None, use_amp=False, scheduler=None,
-    world_size=1, rank=0,
+    world_size=1, rank=0, shared_params=None,
+    ema: ModelEMA | None = None, ema_source_model: nn.Module | None = None,
 ) -> dict:
     del tokenizer
     model.train()
@@ -1307,10 +1446,11 @@ def train_one_epoch(
     rl = rb = rlb = rcomp = rinter = rent = rent_b = rgn = rtw = 0.0
     rgate: torch.Tensor | None = None; rgate_cnt = 0
     ac_dev = "cuda" if device.startswith("cuda") else "cpu"
-    ac_dtype = torch.float16 if ac_dev == "cuda" else torch.bfloat16
+    ac_dtype = resolve_autocast_dtype(ac_dev)
     it = build_progress(loader, total=len(loader), desc=f"train e{epoch}", leave=False)
     ec_weight = get_effective_competition_weight(args, epoch)
     prof = bool(getattr(args, "profile_performance", False))
+    dynamic_batching = int(getattr(args, "max_tokens_per_batch", 0)) > 0
     timing = {"data": 0., "transfer": 0., "forward": 0., "competition": 0., "backward": 0., "optimizer": 0.}
     t_end = time.perf_counter()
     it_obj = iter(it)
@@ -1326,6 +1466,14 @@ def train_one_epoch(
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
         synchronize_for_timing(device, prof)
         timing["transfer"] += time.perf_counter() - t0
+        if prof and dynamic_batching and rank == 0:
+            total_frames = int(batch["input_lengths"].sum().item())
+            max_frames = int(batch["input_lengths"].max().item())
+            print(
+                f"epoch={epoch} step={step}/{len(loader)} dynamic_batch "
+                f"size={int(batch['input_lengths'].numel())} total_frames={total_frames} max_frames={max_frames}",
+                flush=True,
+            )
 
         if (step - 1) % accum == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -1378,26 +1526,35 @@ def train_one_epoch(
         else:
             scaled.backward()
 
-        # ── Expert Parallel: manually reduce non-expert gradients ──
-        if world_size > 1 and getattr(args, "expert_parallel", True):
-            _reduce_non_expert_gradients(model, world_size)
-
         synchronize_for_timing(device, prof)
         timing["backward"] += time.perf_counter() - t0
 
         t0 = time.perf_counter()
         gn = 0.0
+        did_step = False
         if step % accum == 0 or step == len(loader):
+            # ── Expert Parallel: reduce non-expert gradients only before optimizer step ──
+            if world_size > 1 and getattr(args, "expert_parallel", True):
+                _reduce_non_expert_gradients(model, world_size, _shared_params=shared_params)
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
                 gn = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
                 scaler.step(optimizer); scaler.update()
+                did_step = True
             else:
                 gn = float(nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
-                optimizer.step()
+                if math.isfinite(gn):
+                    optimizer.step()
+                    did_step = True
+                else:
+                    if rank == 0:
+                        print(f"  [WARN] epoch={epoch} step={step}: grad_norm={gn}, skipping optimizer step", flush=True)
+                    optimizer.zero_grad(set_to_none=True)
             if world_size > 1 and getattr(args, "expert_parallel", True):
                 _sync_batchnorm_buffers(model, world_size)
             if scheduler is not None: scheduler.step()
+            if did_step and ema is not None and ema_source_model is not None and epoch >= int(getattr(args, "ema_start_epoch", 1)):
+                ema.update(ema_source_model)
         synchronize_for_timing(device, prof)
         timing["optimizer"] += time.perf_counter() - t0
 
@@ -1426,8 +1583,6 @@ def train_one_epoch(
                     "global_step": (epoch - 1) * len(loader) + step, "epoch": epoch,
                     "train/loss_step": rl / max(1, rtw), "train/lr": lr_,
                 })
-        if device.startswith("cuda") and world_size > 1 and getattr(args, "expert_parallel", True):
-            torch.cuda.empty_cache()
         t_end = time.perf_counter()
 
     # ── Reduce metrics across ranks ──
@@ -1470,7 +1625,7 @@ def evaluate(model, loader, tokenizer, ctc_loss, args, device, stage="eval",
     fit_store = []
     ec_weight = get_effective_competition_weight(args, epoch)
     ac_dev = "cuda" if device.startswith("cuda") else "cpu"
-    ac_dtype = torch.float16 if ac_dev == "cuda" else torch.bfloat16
+    ac_dtype = resolve_autocast_dtype(ac_dev)
     it = build_progress(loader, total=len(loader), desc=stage, leave=False)
 
     for step, batch in enumerate(it, 1):
@@ -1581,6 +1736,14 @@ def main() -> None:
         else:
             _backend = _backend_arg
 
+        # Bind each rank to its target GPU before NCCL init so auxiliary
+        # communicators/context allocation do not all land on cuda:0.
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cpu"
+
         # Apply Kaggle/sandbox-friendly NCCL env vars if not already set
         if _backend == "nccl":
             os.environ.setdefault("NCCL_P2P_DISABLE", "1")
@@ -1593,8 +1756,6 @@ def main() -> None:
             backend=_backend,
             timeout=datetime.timedelta(seconds=1800),
         )
-        torch.cuda.set_device(local_rank)
-        device = f"cuda:{local_rank}"
         if is_main:
             print(f"Distributed backend: {_backend}", flush=True)
 
@@ -1676,25 +1837,74 @@ def main() -> None:
                                           data_on_device=data_on_device, memory_resident=mem_resident)
 
         # ── DataLoaders with DistributedSampler ───────────────────────────
-        from torch.utils.data.distributed import DistributedSampler
-
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) \
-            if world_size > 1 else None
-        valid_sampler = DistributedSampler(valid_ds, num_replicas=world_size, rank=rank, shuffle=False) \
-            if world_size > 1 else None
-        test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size, rank=rank, shuffle=False) \
-            if world_size > 1 and test_ds else None
-
-        def _make_loader(ds, sampler, shuffle_flag):
-            return torch.utils.data.DataLoader(
-                ds, batch_size=args.batch_size,
-                shuffle=(sampler is None and shuffle_flag),
-                sampler=sampler, collate_fn=collate_fn, **loader_kw,
+        max_tokens_per_batch = max(0, int(getattr(args, "max_tokens_per_batch", 0)))
+        if max_tokens_per_batch > 0:
+            train_sampler = DynamicBatchSampler(
+                resolve_dataset_length_hints(train_ds, args),
+                max_tokens_per_batch,
+                shuffle=True,
+                seed=args.seed,
+                num_replicas=world_size,
+                rank=rank,
+            )
+            valid_sampler = DynamicBatchSampler(
+                resolve_dataset_length_hints(valid_ds, args),
+                max_tokens_per_batch,
+                shuffle=False,
+                seed=args.seed,
+                num_replicas=world_size,
+                rank=rank,
+            )
+            test_sampler = (
+                DynamicBatchSampler(
+                    resolve_dataset_length_hints(test_ds, args),
+                    max_tokens_per_batch,
+                    shuffle=False,
+                    seed=args.seed,
+                    num_replicas=world_size,
+                    rank=rank,
+                )
+                if test_ds
+                else None
             )
 
-        train_loader = _make_loader(train_ds, train_sampler, True)
-        valid_loader = _make_loader(valid_ds, valid_sampler, False)
-        test_loader  = _make_loader(test_ds,  test_sampler,  False) if test_ds else None
+            def _make_dynamic_loader(ds, batch_sampler):
+                return torch.utils.data.DataLoader(
+                    ds,
+                    batch_sampler=batch_sampler,
+                    collate_fn=collate_fn,
+                    **loader_kw,
+                )
+
+            train_loader = _make_dynamic_loader(train_ds, train_sampler)
+            valid_loader = _make_dynamic_loader(valid_ds, valid_sampler)
+            test_loader = _make_dynamic_loader(test_ds, test_sampler) if test_ds and test_sampler is not None else None
+            if is_main:
+                print(
+                    f"Dynamic batching enabled: max_tokens_per_batch={max_tokens_per_batch} "
+                    f"train_batches={len(train_loader)} valid_batches={len(valid_loader)}",
+                    flush=True,
+                )
+        else:
+            from torch.utils.data.distributed import DistributedSampler
+
+            train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) \
+                if world_size > 1 else None
+            valid_sampler = DistributedSampler(valid_ds, num_replicas=world_size, rank=rank, shuffle=False) \
+                if world_size > 1 else None
+            test_sampler  = DistributedSampler(test_ds,  num_replicas=world_size, rank=rank, shuffle=False) \
+                if world_size > 1 and test_ds else None
+
+            def _make_loader(ds, sampler, shuffle_flag):
+                return torch.utils.data.DataLoader(
+                    ds, batch_size=args.batch_size,
+                    shuffle=(sampler is None and shuffle_flag),
+                    sampler=sampler, collate_fn=collate_fn, **loader_kw,
+                )
+
+            train_loader = _make_loader(train_ds, train_sampler, True)
+            valid_loader = _make_loader(valid_ds, valid_sampler, False)
+            test_loader  = _make_loader(test_ds,  test_sampler,  False) if test_ds else None
 
         # ── Model ──────────────────────────────────────────────────────────
         # Pass rank/world_size so the model builds EP or standard FFN.
@@ -1724,6 +1934,13 @@ def main() -> None:
                         flush=True,
                     )
 
+        ema = ModelEMA(raw_model, decay=args.ema_decay) if float(getattr(args, "ema_decay", 0.0)) > 0.0 else None
+        if ema is not None and is_main:
+            print(
+                f"EMA enabled: decay={float(args.ema_decay):.6f} start_epoch={int(args.ema_start_epoch)}",
+                flush=True,
+            )
+
         if is_main:
             total_params = sum(p.numel() for p in raw_model.parameters())
             expert_params = sum(p.numel() for n, p in raw_model.named_parameters()
@@ -1732,17 +1949,51 @@ def main() -> None:
                   f"Expert params per GPU: {expert_params:,}  "
                   f"Shared params: {total_params - expert_params:,}", flush=True)
 
+        # Pre-compute shared (non-expert) params for EP gradient reduction
+        _shared_params = precompute_shared_params(raw_model) if use_ep else None
+
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = build_lr_scheduler(optimizer, args, len(train_loader))
         ctc_loss_fn = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True, reduction="mean")
 
-        # ── Training loop ──────────────────────────────────────────────────
+        # ── Resume from checkpoint ─────────────────────────────────────────
+        start_epoch = 1
         best_cer = float("inf"); no_imp = 0
+        if args.resume:
+            resume_path = Path(args.resume)
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            ckpt = torch.load(resume_path, map_location=device)
+            missing, unexpected = raw_model.load_state_dict(ckpt["model_state"], strict=False)
+            if is_main and missing:
+                print(f"[Resume] Missing keys (newly initialized): {missing}", flush=True)
+            if is_main and unexpected:
+                print(f"[Resume] Unexpected keys (ignored): {unexpected}", flush=True)
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if "scheduler_state" in ckpt and ckpt["scheduler_state"] is not None and scheduler is not None:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            if "scaler_state" in ckpt and ckpt["scaler_state"] is not None and scaler is not None:
+                scaler.load_state_dict(ckpt["scaler_state"])
+            if ema is not None and ckpt.get("ema_model_state") is not None:
+                ema.load_state_dict(ckpt["ema_model_state"])
+            if "best_valid_cer" in ckpt:
+                best_cer = ckpt["best_valid_cer"]
+            if "epoch" in ckpt:
+                start_epoch = ckpt["epoch"] + 1
+            if is_main:
+                print(f"Resumed from {resume_path} (epoch {start_epoch - 1}, "
+                      f"best_cer={best_cer:.6f}). Training from epoch {start_epoch}.",
+                      flush=True)
+            if world_size > 1:
+                dist.barrier()
+
+        # ── Training loop ──────────────────────────────────────────────────
         eval_every = max(1, int(args.eval_every_epochs))
         patience   = max(0, int(args.early_stop_patience))
         history: list = []
 
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             # Set epoch so DistributedSampler re-shuffles correctly each epoch
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -1757,6 +2008,7 @@ def main() -> None:
                 optimizer=optimizer, ctc_loss=ctc_loss_fn, args=args, device=device,
                 epoch=epoch, wandb_run=wandb_run, scaler=scaler, use_amp=use_amp,
                 scheduler=scheduler, world_size=world_size, rank=rank,
+                shared_params=_shared_params, ema=ema, ema_source_model=raw_model,
             )
 
             # ── Temperature annealing ─────────────────────────────────────
@@ -1794,8 +2046,9 @@ def main() -> None:
                     })
                 continue
 
+            eval_model = ema.ema_model if ema is not None and ema.ready else model
             valid_m = evaluate(
-                model=model, loader=valid_loader, tokenizer=tokenizer,
+                model=eval_model, loader=valid_loader, tokenizer=tokenizer,
                 ctc_loss=ctc_loss_fn, args=args, device=device,
                 stage=f"valid e{epoch}", use_amp=use_amp, epoch=epoch,
                 world_size=world_size, rank=rank,
@@ -1847,18 +2100,26 @@ def main() -> None:
                 }
                 history.append(epoch_rec)
 
+                with (output_dir / "valid_cer_wer.txt").open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"epoch={epoch}\tvalid_cer={valid_m['cer']:.6f}\tvalid_wer={valid_m['wer']:.6f}\n"
+                    )
+
             if is_best:
                 best_cer = valid_m["cer"]; no_imp = 0
                 if is_main:
                     torch.save({
+                        "epoch": epoch,
                         "model_state": raw_model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict() if scheduler else None,
+                        "scaler_state": scaler.state_dict() if scaler is not None else None,
                         "config": vars(args),
                         "vocab": tokenizer.id_to_token,
                         "best_valid_cer": best_cer,
                         "expert_parallel": use_ep,
                         "world_size": world_size,
+                        "ema_model_state": ema.state_dict() if ema is not None else None,
                     }, output_dir / "best.pt")
                     save_json(output_dir / "best_valid_metrics.json", valid_m)
                     log_wandb_metrics(wandb_run, {"global_step": epoch * len(train_loader),
@@ -1876,9 +2137,12 @@ def main() -> None:
         # ── Test evaluation ────────────────────────────────────────────────
         if test_loader is not None and (output_dir / "best.pt").exists():
             ckpt = torch.load(output_dir / "best.pt", map_location=device)
-            raw_model.load_state_dict(ckpt["model_state"])
+            raw_model.load_state_dict(ckpt["model_state"], strict=False)
+            if ema is not None and ckpt.get("ema_model_state") is not None:
+                ema.load_state_dict(ckpt["ema_model_state"])
+            test_eval_model = ema.ema_model if ema is not None and ema.ready else model
             test_m = evaluate(
-                model=model, loader=test_loader, tokenizer=tokenizer,
+                model=test_eval_model, loader=test_loader, tokenizer=tokenizer,
                 ctc_loss=ctc_loss_fn, args=args, device=device, stage="test",
                 use_amp=use_amp, epoch=history[-1]["epoch"] if history else args.epochs,
                 world_size=world_size, rank=rank,
