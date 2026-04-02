@@ -154,14 +154,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr-scale", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--entropy-bonus-weight", type=float, default=0.0)
+    parser.add_argument("--router-z-loss-weight", type=float, default=0.001,
+                        help="Weight for router z-loss (stabilises logits, prevents collapse)")
     parser.add_argument("--temperature-anneal-start", type=float, default=None)
     parser.add_argument("--temperature-anneal-end", type=float, default=None)
     parser.add_argument("--temperature-anneal-epochs", type=int, default=0)
     parser.add_argument("--spec-augment", default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--freq-mask-param", type=int, default=27)
-    parser.add_argument("--time-mask-param", type=int, default=100)
-    parser.add_argument("--num-freq-masks", type=int, default=2)
-    parser.add_argument("--num-time-masks", type=int, default=2)
+    parser.add_argument("--freq-mask-param", type=int, default=15)
+    parser.add_argument("--time-mask-param", type=int, default=50)
+    parser.add_argument("--num-freq-masks", type=int, default=1)
+    parser.add_argument("--num-time-masks", type=int, default=1)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--decode-mode", choices=("greedy", "beam"), default="greedy")
     parser.add_argument("--beam-width", type=int, default=1)
@@ -185,7 +187,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--tf32", choices=("auto", "on", "off"), default="auto")
     parser.add_argument("--eval-every-epochs", type=int, default=1)
-    parser.add_argument("--early-stop-patience", type=int, default=0)
+    parser.add_argument("--early-stop-patience", type=int, default=7)
     parser.add_argument(
         "--ema-decay",
         type=float,
@@ -208,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--layer-drop", type=float, default=0.1)
     parser.add_argument("--intermediate-ctc-weight", type=float, default=0.3)
-    parser.add_argument("--intermediate-ctc-layer", type=int, default=0)
+    parser.add_argument("--intermediate-ctc-layer", type=int, default=3)
     parser.add_argument("--gradient-checkpoint", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable gradient checkpointing to reduce GPU memory at the cost of extra compute.")
     parser.add_argument("--expert-merge-noise", type=float, default=0.01,
@@ -647,7 +649,21 @@ if TORCH_IMPORT_ERROR is None:
             # Sentence-level gates for competition/logging compatibility
             gate_mean = (full_gates * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1.0)  # (B, E)
 
-            aux = {"pooled": self._pooled_hidden(h, mask), "router_gates": gate_mean}
+            # --- Auxiliary load-balancing losses ---
+            mask_3d = mask.unsqueeze(-1)                          # (B, T, 1)
+            total_tokens = mask.sum().clamp_min(1)
+            # Switch Transformer LB: N * sum(f_i * P_i)
+            # f_i = hard token fraction per expert (non-differentiable)
+            f_i = ((full_gates > 0).float() * mask_3d).sum(dim=[0, 1]) / total_tokens
+            # P_i = mean dense router probability (differentiable)
+            router_probs = torch.softmax(router_logits, dim=-1)   # (B, T, E) dense
+            P_i = (router_probs * mask_3d).sum(dim=[0, 1]) / total_tokens
+            switch_lb_loss = self.num_experts * (f_i * P_i).sum()
+            # Z-loss: penalise large router logits to prevent collapse
+            z_loss = (torch.logsumexp(router_logits, dim=-1) ** 2 * mask).sum() / total_tokens
+
+            aux = {"pooled": self._pooled_hidden(h, mask), "router_gates": gate_mean,
+                   "switch_lb_loss": switch_lb_loss, "z_loss": z_loss}
             if return_all_experts:
                 aux["all_expert_outputs"] = torch.stack(stacked_list, dim=2)  # (B, T, E, D)
             return merged, gate_mean, aux
@@ -838,7 +854,17 @@ if TORCH_IMPORT_ERROR is None:
             # Sentence-level gates for competition/logging compatibility
             gate_mean = (full_gates * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True).clamp_min(1.0)
 
-            aux = {"pooled": self._pooled(hidden_states, mask), "router_gates": gate_mean}
+            # --- Auxiliary load-balancing losses ---
+            mask_3d = mask.unsqueeze(-1)                          # (B, T, 1)
+            total_tokens = mask.sum().clamp_min(1)
+            f_i = ((full_gates > 0).float() * mask_3d).sum(dim=[0, 1]) / total_tokens
+            router_probs = torch.softmax(router_logits, dim=-1)
+            P_i = (router_probs * mask_3d).sum(dim=[0, 1]) / total_tokens
+            switch_lb_loss = self.num_experts * (f_i * P_i).sum()
+            z_loss = (torch.logsumexp(router_logits, dim=-1) ** 2 * mask).sum() / total_tokens
+
+            aux = {"pooled": self._pooled(hidden_states, mask), "router_gates": gate_mean,
+                   "switch_lb_loss": switch_lb_loss, "z_loss": z_loss}
             if return_all_experts:
                 aux["all_expert_outputs"] = all_out_btde
             return merged, gate_mean, aux
@@ -1052,6 +1078,7 @@ if TORCH_IMPORT_ERROR is None:
             h, pos_enc = self.position(h)
             mask = lengths_to_mask(out_len.to(h.device), h.size(1))
             routing_vals, block_aux = [], []
+            moe_lb_losses, moe_z_losses = [], []
             inter_log_probs = None
             for bi, block in enumerate(self.blocks):
                 fe = forced_expert if forced_experts is None else forced_experts.get(bi, forced_expert)
@@ -1064,6 +1091,11 @@ if TORCH_IMPORT_ERROR is None:
                     h, routing, aux = block(h, mask, pos_enc, forced_expert=fe, return_all_experts=return_aux)
                 if routing is not None:
                     routing_vals.append(routing)
+                if aux is not None:
+                    if "switch_lb_loss" in aux:
+                        moe_lb_losses.append(aux["switch_lb_loss"])
+                    if "z_loss" in aux:
+                        moe_z_losses.append(aux["z_loss"])
                 if return_aux:
                     block_aux.append({"block_index": bi, "routing": routing, "aux": aux})
                 if self._inter_ctc_layer >= 0 and bi == self._inter_ctc_layer and self.training:
@@ -1071,8 +1103,14 @@ if TORCH_IMPORT_ERROR is None:
             h = self.output_norm(h)
             log_probs = F.log_softmax(self.ctc_head(self.projector(h)), dim=-1)
             merged_routing = torch.stack(routing_vals).mean(0) if routing_vals else None
-            aux_out = {"block_aux": block_aux, "mask": mask, "output_lengths": out_len} if return_aux else None
-            return log_probs, out_len, merged_routing, aux_out, inter_log_probs
+            _dev = inputs.device
+            moe_losses = {
+                "lb_loss": torch.stack(moe_lb_losses).mean() if moe_lb_losses else torch.tensor(0., device=_dev),
+                "z_loss": torch.stack(moe_z_losses).mean() if moe_z_losses else torch.tensor(0., device=_dev),
+            }
+            if return_aux:
+                moe_losses.update({"block_aux": block_aux, "mask": mask, "output_lengths": out_len})
+            return log_probs, out_len, merged_routing, moe_losses, inter_log_probs
 
         def get_moe_modules(self):
             return [block.ffn for block in self.blocks
@@ -1097,10 +1135,24 @@ else:
 # ===========================================================================
 
 def routing_regularizer(avg_gates, num_experts):
+    """Switch Transformer style load-balancing loss.
+
+    Given avg_gates of shape (B, E) — the mean gate value per expert
+    (averaged over time frames), compute:
+        loss = num_experts * sum_i(f_i * P_i)
+    where f_i = fraction of tokens routed to expert i (usage frequency)
+    and   P_i = mean router probability for expert i.
+
+    This penalises any expert that gets both high probability AND high
+    usage — which is exactly the imbalanced state we want to avoid.
+    """
     if avg_gates is None:
         return torch.tensor(0.0)
-    expected = torch.full((num_experts,), 1.0 / num_experts, device=avg_gates.device, dtype=avg_gates.dtype)
-    return F.mse_loss(avg_gates.mean(0), expected)
+    # avg_gates: (B, E) — mean gate weight per expert per sample
+    # f_i: fraction of total probability mass assigned to each expert (proxy for token fraction)
+    f = avg_gates.mean(dim=0)           # (E,)  mean over batch
+    P = avg_gates.mean(dim=0)           # (E,)  same quantity for top-k soft gates
+    return num_experts * (f * P).sum()  # scalar
 
 
 def routing_entropy(gates, eps=1e-8):
@@ -1443,7 +1495,7 @@ def train_one_epoch(
     del tokenizer
     model.train()
     accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
-    rl = rb = rlb = rcomp = rinter = rent = rent_b = rgn = rtw = 0.0
+    rl = rb = rlb = rzl = rcomp = rinter = rent = rent_b = rgn = rtw = 0.0
     rgate: torch.Tensor | None = None; rgate_cnt = 0
     ac_dev = "cuda" if device.startswith("cuda") else "cpu"
     ac_dtype = resolve_autocast_dtype(ac_dev)
@@ -1489,7 +1541,7 @@ def train_one_epoch(
 
         t0 = time.perf_counter()
         with torch.autocast(device_type=ac_dev, dtype=ac_dtype, enabled=use_amp):
-            lp, ol, routing, _, inter_lp = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            lp, ol, routing, moe_losses, inter_lp = model(batch["inputs"], batch["input_lengths"], return_aux=False)
             raw_ctc = ctc_loss(lp.transpose(0, 1), batch["targets"], ol.cpu(), batch["target_lengths"])
             ls = float(getattr(args, "label_smoothing", 0.0))
             base_loss = (1 - ls) * raw_ctc + ls * (-lp.mean()) if ls > 0 else raw_ctc
@@ -1498,7 +1550,8 @@ def train_one_epoch(
             if iw > 0 and inter_lp is not None:
                 ri_raw = ctc_loss(inter_lp.transpose(0, 1), batch["targets"], ol.cpu(), batch["target_lengths"])
                 inter_ctc = (1 - ls) * ri_raw + ls * (-inter_lp.mean()) if ls > 0 else ri_raw
-            lb_loss = routing_regularizer(routing, args.num_experts) if routing is not None else torch.tensor(0., device=lp.device)
+            lb_loss = moe_losses["lb_loss"]
+            z_loss = moe_losses["z_loss"]
         synchronize_for_timing(device, prof)
         timing["forward"] += time.perf_counter() - t0
 
@@ -1516,8 +1569,9 @@ def train_one_epoch(
         timing["competition"] += time.perf_counter() - t0
 
         eb = float(getattr(args, "entropy_bonus_weight", 0.0))
+        zw = float(getattr(args, "router_z_loss_weight", 0.001))
         rent_val = routing_entropy(routing, eps=args.competition_epsilon) if routing is not None else torch.tensor(0., device=lp.device)
-        loss = base_loss + args.load_balance_weight * lb_loss + ec_weight * comp_loss - eb * rent_val + iw * inter_ctc
+        loss = base_loss + args.load_balance_weight * lb_loss + zw * z_loss + ec_weight * comp_loss - eb * rent_val + iw * inter_ctc
         scaled = loss / accum
 
         t0 = time.perf_counter()
@@ -1560,7 +1614,7 @@ def train_one_epoch(
 
         bs = int(batch["input_lengths"].size(0))
         rtw += bs; rl += float(loss.item()) * bs; rb += float(base_loss.item()) * bs
-        rlb += float(lb_loss.item()) * bs; rcomp += float(comp_loss.item()) * bs
+        rlb += float(lb_loss.item()) * bs; rzl += float(z_loss.item()) * bs; rcomp += float(comp_loss.item()) * bs
         rinter += float(inter_ctc.item()) * bs; rgn += gn * bs
         if routing is not None:
             rent += float(routing_entropy(routing, eps=args.competition_epsilon).item()) * routing.size(0)
@@ -1577,7 +1631,7 @@ def train_one_epoch(
             if rank == 0:
                 print(f"epoch={epoch} step={step}/{len(loader)} "
                       f"train_loss={rl/max(1,rtw):.4f} ctc={rb/max(1,rtw):.4f} "
-                      f"lb={rlb/max(1,rtw):.4f} comp={rcomp/max(1,rtw):.4f} "
+                      f"lb={rlb/max(1,rtw):.4f} zl={rzl/max(1,rtw):.4f} comp={rcomp/max(1,rtw):.4f} "
                       f"grad={rgn/max(1,rtw):.4f} lr={lr_:.6g}", flush=True)
                 log_wandb_metrics(wandb_run, {
                     "global_step": (epoch - 1) * len(loader) + step, "epoch": epoch,
@@ -1591,6 +1645,7 @@ def train_one_epoch(
         rl     = _all_reduce_scalar(rl, device)
         rb     = _all_reduce_scalar(rb, device)
         rlb    = _all_reduce_scalar(rlb, device)
+        rzl    = _all_reduce_scalar(rzl, device)
         rcomp  = _all_reduce_scalar(rcomp, device)
         rinter = _all_reduce_scalar(rinter, device)
         rent   = _all_reduce_scalar(rent, device)
@@ -1603,6 +1658,7 @@ def train_one_epoch(
     return {
         "loss": rl / max(1, rtw), "base_loss": rb / max(1, rtw),
         "ctc_loss": rb / max(1, rtw), "load_balance_loss": rlb / max(1, rtw),
+        "z_loss": rzl / max(1, rtw),
         "competition_loss": rcomp / max(1, rtw), "inter_ctc_loss": rinter / max(1, rtw),
         "routing_entropy": rent / max(1, rgate_cnt), "grad_norm": rgn / max(1, rtw),
         "lr": float(optimizer.param_groups[0]["lr"]), "effective_competition_weight": ec_weight,
@@ -1631,10 +1687,10 @@ def evaluate(model, loader, tokenizer, ctc_loss, args, device, stage="eval",
     for step, batch in enumerate(it, 1):
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
         with torch.autocast(device_type=ac_dev, dtype=ac_dtype, enabled=use_amp):
-            lp, ol, routing, _, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            lp, ol, routing, moe_losses, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
             psl = compute_per_sample_ctc_losses(lp, batch["targets"], ol, batch["target_lengths"], ctc_loss)
             base_loss = psl.mean()
-            lb_loss = routing_regularizer(routing, args.num_experts) if routing is not None else torch.tensor(0., device=lp.device)
+            lb_loss = moe_losses["lb_loss"]
 
         comp_loss = torch.tensor(0., device=lp.device)
         if routing is not None and should_compute_competition_metrics(args, stage, step, epoch=epoch):

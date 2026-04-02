@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional existing vocabulary JSON. Use the train split vocabulary for valid/test cache generation.",
     )
     add_tokenizer_args(parser)
-    parser.add_argument("--sample-rate", type=int, default=22050, help="Target sample rate.")
+    parser.add_argument("--sample-rate", type=int, default=16000, help="Target sample rate.")
     parser.add_argument("--n-fft", type=int, default=512, help="FFT size for log-mel extraction.")
     parser.add_argument("--hop-length", type=int, default=160, help="STFT hop length.")
     parser.add_argument("--win-length", type=int, default=400, help="STFT window length.")

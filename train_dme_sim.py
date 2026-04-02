@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -193,7 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-layers", type=int, default=3, help="BiGRU layers.")
     parser.add_argument("--projector-dim", type=int, default=256, help="Projector output size.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate.")
-    parser.add_argument("--sample-rate", type=int, default=22050, help="Expected sample rate.")
+    parser.add_argument("--sample-rate", type=int, default=16000, help="Expected sample rate.")
     parser.add_argument("--n-fft", type=int, default=512, help="FFT size.")
     parser.add_argument("--hop-length", type=int, default=160, help="STFT hop length.")
     parser.add_argument("--win-length", type=int, default=400, help="STFT window length.")
@@ -1356,7 +1357,21 @@ def resolve_loader_kwargs(
     memory_resident: bool = False,
 ) -> dict[str, Any]:
     force_single_process = data_on_device or memory_resident
-    num_workers = 0 if force_single_process else max(0, int(args.num_workers))
+    requested_num_workers = max(0, int(args.num_workers))
+    use_windows_safe_loader = (
+        os.name == "nt"
+        and getattr(args, "data_mode", "raw") == "raw"
+        and not force_single_process
+    )
+    num_workers = 0 if force_single_process else requested_num_workers
+    if use_windows_safe_loader and num_workers > 0:
+        num_workers = 0
+        print(
+            "Windows raw-audio mode detected; clamping DataLoader to "
+            "num_workers=0 (main-process loading) to avoid pickle errors "
+            "with local collate_fn closures.",
+            flush=True,
+        )
     pin_memory = False if data_on_device else resolve_mode(
         getattr(args, "pin_memory", "auto"),
         is_cuda,
@@ -1372,10 +1387,15 @@ def resolve_loader_kwargs(
             is_cuda,
             default_on_cuda=True,
         )
+        if use_windows_safe_loader:
+            use_persistent = False
         if use_persistent:
             kwargs["persistent_workers"] = True
         if int(args.prefetch_factor) > 0:
-            kwargs["prefetch_factor"] = int(args.prefetch_factor)
+            prefetch_factor = int(args.prefetch_factor)
+            if use_windows_safe_loader:
+                prefetch_factor = 1
+            kwargs["prefetch_factor"] = prefetch_factor
     return kwargs
 
 

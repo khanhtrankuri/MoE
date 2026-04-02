@@ -423,6 +423,11 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="If mean cosine similarity between experts > threshold, skip merge and log warning.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="Path to a checkpoint (.pt) to resume training from. Restores model, optimizer, scheduler, EMA, scaler, and epoch.",
+    )
     parser.set_defaults(tokenizer_type="grapheme")
     add_profiling_args(parser)
     return parser.parse_args()
@@ -2095,11 +2100,36 @@ def main() -> None:
 
         best_valid_cer = float("inf")
         no_improve_rounds = 0
+        start_epoch = 1
         eval_every = max(1, int(args.eval_every_epochs))
         patience = max(0, int(args.early_stop_patience))
         history: list[dict[str, Any]] = []
 
-        for epoch in range(1, args.epochs + 1):
+        # ---- Resume from checkpoint ----
+        if args.resume_checkpoint is not None:
+            resume_path = Path(args.resume_checkpoint).resolve()
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+            print(f"Resuming from checkpoint: {resume_path}", flush=True)
+            ckpt = torch.load(resume_path, map_location=device)
+            raw_model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            if scheduler is not None and ckpt.get("scheduler_state") is not None:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+            if scaler is not None and ckpt.get("scaler_state") is not None:
+                scaler.load_state_dict(ckpt["scaler_state"])
+            if ema is not None and ckpt.get("ema_model_state") is not None:
+                ema.load_state_dict(ckpt["ema_model_state"])
+            if "best_valid_cer" in ckpt:
+                best_valid_cer = ckpt["best_valid_cer"]
+            if "epoch" in ckpt:
+                start_epoch = ckpt["epoch"] + 1
+            print(
+                f"Resumed: start_epoch={start_epoch} best_valid_cer={best_valid_cer:.4f}",
+                flush=True,
+            )
+
+        for epoch in range(start_epoch, args.epochs + 1):
             print(f"Starting epoch {epoch}/{args.epochs}", flush=True)
             train_metrics = train_one_epoch(
                 model=model,
@@ -2283,9 +2313,12 @@ def main() -> None:
                         "model_state": raw_model.state_dict(),
                         "optimizer_state": optimizer.state_dict(),
                         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+                        "scaler_state": scaler.state_dict() if scaler is not None else None,
                         "config": vars(args),
                         "vocab": tokenizer.id_to_token,
                         "best_valid_cer": best_valid_cer,
+                        "epoch": epoch,
+                        "global_step": global_step,
                         "ema_model_state": ema.state_dict() if ema is not None else None,
                     },
                     output_dir / "best.pt",
