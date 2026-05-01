@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import math
@@ -151,6 +151,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Refresh expensive competition targets every N training steps. 1 keeps previous behavior.",
+    )
+    parser.add_argument(
+        "--competition-alpha",
+        type=float,
+        default=1.0,
+        help="Alpha for fitness normalization in natural niches: z = sum(scores)**alpha. 1.0 = no change, 0.5 = sqrt.",
+    )
+    parser.add_argument(
+        "--competition-matchmaker",
+        action="store_true",
+        help="Use matchmaker mechanism: select parent_2 by difference from parent_1 (natural niches).",
     )
     parser.add_argument(
         "--competition-warmup-epochs",
@@ -405,6 +416,50 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Encoder layer index for intermediate CTC loss. 0 = auto (middle layer).",
     )
+
+    # Decoder arguments for Hybrid CTC + Attention
+    parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=6,
+        help="Number of Transformer decoder layers. 0 disables the attention decoder.",
+    )
+    parser.add_argument(
+        "--decoder-dim",
+        type=int,
+        default=256,
+        help="Decoder model dimension.",
+    )
+    parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads in the decoder.",
+    )
+    parser.add_argument(
+        "--decoder-ffn-hidden-dim",
+        type=int,
+        default=1024,
+        help="Hidden size of the FFN in decoder layers.",
+    )
+    parser.add_argument(
+        "--decoder-adapter-hidden-dim",
+        type=int,
+        default=256,
+        help="Hidden size of the adapter branch in decoder MoE FFN.",
+    )
+    parser.add_argument(
+        "--decoder-moe",
+        action="store_true",
+        help="Use SharedAdapterMoEFFN in the decoder instead of dense FFN.",
+    )
+    parser.add_argument(
+        "--decoder-loss-weight",
+        type=float,
+        default=0.7,
+        help="Weight for the attention decoder loss in the hybrid loss. CTC weight = 1 - this value.",
+    )
+
     parser.add_argument(
         "--gradient-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -611,6 +666,8 @@ if TORCH_IMPORT_ERROR is None:
 
 
     class SharedAdapterMoEFFN(nn.Module):
+        """Image-aligned MoE: one shared trunk (FFN_share) + per-expert adapters."""
+
         def __init__(
             self,
             model_dim: int,
@@ -623,32 +680,26 @@ if TORCH_IMPORT_ERROR is None:
             super().__init__()
             self.temperature = float(temperature)
             self.num_experts = int(num_experts)
-            self.router = nn.Linear(model_dim, num_experts)
-            self.trunks = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.Linear(model_dim, hidden_dim),
-                        nn.GELU(),
-                        nn.Dropout(dropout),
-                    )
-                    for _ in range(num_experts)
-                ]
+
+            # Single shared trunk used by ALL experts (FFN_share in the image)
+            self.share_trunk = nn.Sequential(
+                nn.Linear(model_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
             )
-            self.share_down = nn.ModuleList([nn.Linear(hidden_dim, model_dim) for _ in range(num_experts)])
+            self.share_down = nn.Linear(hidden_dim, model_dim)
+
+            # Per-expert adapters (unique part of each expert)
             self.adapter_up = nn.ModuleList([nn.Linear(hidden_dim, adapter_hidden_dim) for _ in range(num_experts)])
             self.adapter_down = nn.ModuleList([nn.Linear(adapter_hidden_dim, model_dim) for _ in range(num_experts)])
+
+            # Router: utterance-level gating
+            self.router = nn.Linear(model_dim, num_experts)
             self.dropout = nn.Dropout(dropout)
 
         def _pooled_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
             denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
             return (hidden_states * mask.unsqueeze(-1)).sum(dim=1) / denom
-
-        def _expert_forward(self, hidden_states: torch.Tensor, expert_idx: int) -> torch.Tensor:
-            expert_hidden = self.trunks[expert_idx](hidden_states)
-            share_out = self.share_down[expert_idx](expert_hidden)
-            adapter_hidden = F.gelu(self.adapter_up[expert_idx](expert_hidden))
-            adapter_out = self.adapter_down[expert_idx](self.dropout(adapter_hidden))
-            return self.dropout(share_out + adapter_out)
 
         def forward(
             self,
@@ -660,8 +711,15 @@ if TORCH_IMPORT_ERROR is None:
             pooled = self._pooled_hidden(hidden_states, mask)
             gates = torch.softmax(self.router(pooled) / self.temperature, dim=-1)
 
+            # Shared trunk: process ALL tokens through the single shared FFN
+            shared_hidden = self.share_trunk(hidden_states)  # (B, T, hidden_dim)
+            shared_out = self.share_down(shared_hidden)  # (B, T, model_dim)
+
             if forced_expert is not None:
-                output = self._expert_forward(hidden_states, forced_expert)
+                # Forced expert: only compute its adapter
+                adapter_hidden = F.gelu(self.adapter_up[forced_expert](shared_hidden))
+                adapter_out = self.adapter_down[forced_expert](self.dropout(adapter_hidden))
+                output = self.dropout(shared_out + adapter_out)
                 forced_gates = torch.zeros_like(gates)
                 forced_gates[:, forced_expert] = 1.0
                 aux = {"pooled": pooled, "router_gates": gates}
@@ -669,8 +727,14 @@ if TORCH_IMPORT_ERROR is None:
                     aux["all_expert_outputs"] = output.unsqueeze(2)
                 return output, forced_gates, aux
 
-            expert_outputs = [self._expert_forward(hidden_states, idx) for idx in range(self.num_experts)]
-            stacked = torch.stack(expert_outputs, dim=2)
+            # Per-expert adapter outputs on top of shared trunk
+            expert_outputs = []
+            for i in range(self.num_experts):
+                adapter_hidden = F.gelu(self.adapter_up[i](shared_hidden))
+                adapter_out = self.adapter_down[i](self.dropout(adapter_hidden))
+                expert_outputs.append(self.dropout(shared_out + adapter_out))
+
+            stacked = torch.stack(expert_outputs, dim=2)  # (B, T, num_experts, model_dim)
             merged = torch.sum(stacked * gates.unsqueeze(1).unsqueeze(-1), dim=2)
             aux = {"pooled": pooled, "router_gates": gates}
             if return_all_experts:
@@ -679,15 +743,11 @@ if TORCH_IMPORT_ERROR is None:
 
         def get_expert_state(self, expert_idx: int) -> dict[str, dict[str, torch.Tensor]]:
             return {
-                "trunk": {k: v.detach().clone() for k, v in self.trunks[expert_idx].state_dict().items()},
-                "share_down": {k: v.detach().clone() for k, v in self.share_down[expert_idx].state_dict().items()},
                 "adapter_up": {k: v.detach().clone() for k, v in self.adapter_up[expert_idx].state_dict().items()},
                 "adapter_down": {k: v.detach().clone() for k, v in self.adapter_down[expert_idx].state_dict().items()},
             }
 
         def set_expert_state(self, expert_idx: int, state_dict_like: dict[str, dict[str, torch.Tensor]]) -> None:
-            self.trunks[expert_idx].load_state_dict(state_dict_like["trunk"])
-            self.share_down[expert_idx].load_state_dict(state_dict_like["share_down"])
             self.adapter_up[expert_idx].load_state_dict(state_dict_like["adapter_up"])
             self.adapter_down[expert_idx].load_state_dict(state_dict_like["adapter_down"])
 
@@ -733,16 +793,21 @@ if TORCH_IMPORT_ERROR is None:
             if mode != "split_linear":
                 raise ValueError(f"Unsupported merge mode: {mode}")
 
-            state_a = self.get_expert_state(parent_a)
-            state_b = self.get_expert_state(parent_b)
+            # Only merge adapter weights (trunk is shared, not per-expert)
+            state_a = {
+                "adapter_up": self.adapter_up[parent_a].state_dict(),
+                "adapter_down": self.adapter_down[parent_a].state_dict(),
+            }
+            state_b = {
+                "adapter_up": self.adapter_up[parent_b].state_dict(),
+                "adapter_down": self.adapter_down[parent_b].state_dict(),
+            }
             flat_a = self._flatten_state_dict_tensors(state_a)
             flat_b = self._flatten_state_dict_tensors(state_b)
             total_numel = sum(tensor.numel() for _, _, tensor in flat_a)
             split_index = int(round(max(0.0, min(1.0, split_ratio)) * total_numel))
 
             merged_state: dict[str, dict[str, torch.Tensor]] = {
-                "trunk": {},
-                "share_down": {},
                 "adapter_up": {},
                 "adapter_down": {},
             }
@@ -758,7 +823,8 @@ if TORCH_IMPORT_ERROR is None:
                 offset += tensor_a.numel()
 
             if child_idx is not None:
-                self.set_expert_state(child_idx, merged_state)
+                self.adapter_up[child_idx].load_state_dict(merged_state["adapter_up"])
+                self.adapter_down[child_idx].load_state_dict(merged_state["adapter_down"])
             return merged_state
 
 
@@ -905,17 +971,144 @@ if TORCH_IMPORT_ERROR is None:
             return self.final_norm(hidden_states), routing, aux
 
 
-    class EncoderMoECTCModel(nn.Module):
+    class MultiHeadAttention(nn.Module):
+        """Standard multi-head attention (used for both self-attn and cross-attn in decoder)."""
+
+        def __init__(self, model_dim: int, num_heads: int, dropout: float, causal: bool = False):
+            super().__init__()
+            assert model_dim % num_heads == 0
+            self.num_heads = num_heads
+            self.head_dim = model_dim // num_heads
+            self.model_dim = model_dim
+            self.scale = self.head_dim ** -0.5
+            self.causal = causal
+
+            self.w_q = nn.Linear(model_dim, model_dim)
+            self.w_k = nn.Linear(model_dim, model_dim)
+            self.w_v = nn.Linear(model_dim, model_dim)
+            self.w_out = nn.Linear(model_dim, model_dim)
+            self.dropout = nn.Dropout(dropout)
+
+        def forward(
+            self,
+            query: torch.Tensor,
+            key: torch.Tensor | None = None,
+            value: torch.Tensor | None = None,
+            key_padding_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """
+            Args:
+                query: (B, T_q, D)
+                key, value: (B, T_k, D). If None, uses query (self-attention).
+                key_padding_mask: (B, T_k) True = position to ignore
+            """
+            if key is None:
+                key = query
+            if value is None:
+                value = query
+
+            B, T_q, _ = query.shape
+            T_k = key.size(1)
+
+            q = self.w_q(query).view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.w_k(key).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.w_v(value).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+            if self.causal and T_q == T_k:
+                causal_mask = torch.triu(torch.ones(T_q, T_k, device=query.device, dtype=torch.bool), diagonal=1)
+                scores = scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+
+            attn = torch.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+
+            output = torch.matmul(attn, v)
+            output = output.transpose(1, 2).contiguous().view(B, T_q, self.model_dim)
+            return self.w_out(output)
+
+
+    class TransformerDecoderLayer(nn.Module):
+        def __init__(self, args: argparse.Namespace):
+            super().__init__()
+            self.self_attn_norm = nn.LayerNorm(args.decoder_dim)
+            self.self_attn = MultiHeadAttention(
+                model_dim=args.decoder_dim,
+                num_heads=args.decoder_heads,
+                dropout=args.dropout,
+                causal=True,
+            )
+            self.self_attn_dropout = nn.Dropout(args.dropout)
+
+            self.cross_attn_norm = nn.LayerNorm(args.decoder_dim)
+            self.cross_attn = MultiHeadAttention(
+                model_dim=args.decoder_dim,
+                num_heads=args.decoder_heads,
+                dropout=args.dropout,
+                causal=False,
+            )
+            self.cross_attn_dropout = nn.Dropout(args.dropout)
+
+            self.ffn_norm = nn.LayerNorm(args.decoder_dim)
+            if getattr(args, "decoder_moe", False):
+                self.ffn = SharedAdapterMoEFFN(
+                    model_dim=args.decoder_dim,
+                    hidden_dim=args.decoder_ffn_hidden_dim,
+                    adapter_hidden_dim=args.decoder_adapter_hidden_dim,
+                    num_experts=args.num_experts,
+                    temperature=args.router_temperature,
+                    dropout=args.dropout,
+                )
+            else:
+                self.ffn = DenseFFN(args.decoder_dim, args.decoder_ffn_hidden_dim, args.dropout)
+
+        def forward(
+            self,
+            dec_states: torch.Tensor,
+            enc_out: torch.Tensor,
+            dec_padding_mask: torch.Tensor | None = None,
+            enc_padding_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            # Masked self-attention
+            residual = dec_states
+            dec_states = self.self_attn_norm(dec_states)
+            dec_states = self.self_attn(dec_states, key_padding_mask=dec_padding_mask)
+            dec_states = residual + self.self_attn_dropout(dec_states)
+
+            # Cross-attention to encoder
+            residual = dec_states
+            dec_states = self.cross_attn_norm(dec_states)
+            dec_states = self.cross_attn(dec_states, key=enc_out, value=enc_out, key_padding_mask=enc_padding_mask)
+            dec_states = residual + self.cross_attn_dropout(dec_states)
+
+            # FFN
+            residual = dec_states
+            dec_states = self.ffn_norm(dec_states)
+            dec_states, _, _ = self.ffn(dec_states, mask=torch.ones(dec_states.size(0), dec_states.size(1), device=dec_states.device))
+            dec_states = residual + self.self_attn_dropout(dec_states)
+
+            return dec_states
+
+
+    class HybridCTCModel(nn.Module):
         def __init__(self, args: argparse.Namespace, vocab_size: int):
             super().__init__()
             self.num_experts = int(args.num_experts)
             self.gradient_checkpoint = bool(getattr(args, "gradient_checkpoint", False))
             self.ffn_type = args.ffn_type
+            self.use_decoder = getattr(args, "decoder_layers", 0) > 0
+
+            # Encoder (giu nguyen)
             self.subsampling = Conv2dSubsampling(args.n_mels, args.encoder_dim, args.dropout)
             self.position = RelativePositionalEncoding(args.encoder_dim, dropout=args.dropout)
             block_cls = TransformerMoEBlock if args.encoder_type == "transformer" else ConformerMoEBlock
             self.blocks = nn.ModuleList([block_cls(args) for _ in range(args.encoder_layers)])
             self.output_norm = nn.LayerNorm(args.encoder_dim)
+
+            # CTC projection & head
             self.projector = nn.Sequential(
                 nn.Linear(args.encoder_dim, args.projector_dim),
                 nn.GELU(),
@@ -923,6 +1116,7 @@ if TORCH_IMPORT_ERROR is None:
             )
             self.ctc_head = nn.Linear(args.projector_dim, vocab_size)
 
+            # Intermediate CTC (giu nguyen)
             inter_weight = float(getattr(args, "intermediate_ctc_weight", 0.0))
             inter_layer = int(getattr(args, "intermediate_ctc_layer", 0))
             if inter_layer <= 0:
@@ -937,62 +1131,104 @@ if TORCH_IMPORT_ERROR is None:
                 )
                 self.inter_ctc_head = nn.Linear(args.projector_dim, vocab_size)
 
+            # Attention Decoder
+            if self.use_decoder:
+                self.text_embed = nn.Embedding(vocab_size, args.decoder_dim)
+                self.dec_pos = SinusoidalPositionalEncoding(args.decoder_dim, max_len=500)
+                self.decoder_layers = nn.ModuleList([
+                    TransformerDecoderLayer(args) for _ in range(args.decoder_layers)
+                ])
+                self.dec_norm = nn.LayerNorm(args.decoder_dim)
+                self.dec_head = nn.Linear(args.decoder_dim, vocab_size)
+
         def forward(
             self,
             inputs: torch.Tensor,
             input_lengths: torch.Tensor,
+            targets: torch.Tensor | None = None,
+            target_lengths: torch.Tensor | None = None,
             forced_expert: int | None = None,
             forced_experts: dict[int, int] | None = None,
             return_aux: bool = False,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any] | None, torch.Tensor | None]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, dict[str, Any] | None, torch.Tensor | None, torch.Tensor | None]:
+            # Encoder forward
             hidden_states, output_lengths = self.subsampling(inputs, input_lengths.to(inputs.device))
             hidden_states, pos_enc = self.position(hidden_states)
-            mask = lengths_to_mask(output_lengths.to(hidden_states.device), hidden_states.size(1))
+            enc_mask = lengths_to_mask(output_lengths.to(hidden_states.device), hidden_states.size(1))
 
             routing_values: list[torch.Tensor] = []
             block_aux: list[dict[str, Any]] = []
             intermediate_log_probs: torch.Tensor | None = None
+
             for block_idx, block in enumerate(self.blocks):
                 block_forced_expert = forced_expert
                 if forced_experts is not None:
                     block_forced_expert = forced_experts.get(block_idx)
                 if self.gradient_checkpoint and self.training and block_forced_expert is None and not return_aux:
                     hidden_states, routing, aux = torch.utils.checkpoint.checkpoint(
-                        block, hidden_states, mask, pos_enc, block_forced_expert, return_aux,
+                        block, hidden_states, enc_mask, pos_enc, block_forced_expert, return_aux,
                         use_reentrant=False,
                     )
                 else:
                     hidden_states, routing, aux = block(
-                        hidden_states,
-                        mask,
-                        pos_enc,
+                        hidden_states, enc_mask, pos_enc,
                         forced_expert=block_forced_expert,
                         return_all_experts=return_aux,
                     )
                 if routing is not None:
                     routing_values.append(routing)
                 if return_aux:
-                    block_aux.append(
-                        {
-                            "block_index": block_idx,
-                            "routing": routing,
-                            "aux": aux,
-                        }
-                    )
+                    block_aux.append({"block_index": block_idx, "routing": routing, "aux": aux})
                 if self._inter_ctc_layer >= 0 and block_idx == self._inter_ctc_layer and self.training:
                     inter_hidden = self.inter_norm(hidden_states)
                     inter_proj = self.inter_proj(inter_hidden)
                     intermediate_log_probs = F.log_softmax(self.inter_ctc_head(inter_proj), dim=-1)
 
-            hidden_states = self.output_norm(hidden_states)
-            hidden_states = self.projector(hidden_states)
-            logits = self.ctc_head(hidden_states)
-            log_probs = F.log_softmax(logits, dim=-1)
+            enc_out = self.output_norm(hidden_states)
+
+            # CTC branch
+            ctc_hidden = self.projector(enc_out)
+            ctc_logits = self.ctc_head(ctc_hidden)
+            ctc_log_probs = F.log_softmax(ctc_logits, dim=-1)
+
             merged_routing = torch.stack(routing_values, dim=0).mean(dim=0) if routing_values else None
             aux_out = None
             if return_aux:
-                aux_out = {"block_aux": block_aux, "mask": mask, "output_lengths": output_lengths}
-            return log_probs, output_lengths, merged_routing, aux_out, intermediate_log_probs
+                aux_out = {"block_aux": block_aux, "mask": enc_mask, "output_lengths": output_lengths}
+
+            # Attention decoder branch
+            dec_log_probs = None
+            if self.use_decoder and targets is not None and target_lengths is not None:
+                dec_out = self._decode(targets, target_lengths, enc_out, enc_mask)
+                dec_logits = self.dec_head(dec_out)
+                dec_log_probs = F.log_softmax(dec_logits, dim=-1)
+
+            return ctc_log_probs, output_lengths, merged_routing, aux_out, intermediate_log_probs, dec_log_probs
+
+        def _decode(self, targets: torch.Tensor, target_lengths: torch.Tensor, enc_out: torch.Tensor, enc_mask: torch.Tensor) -> torch.Tensor:
+            """Autoregressive decoding for training (teacher forcing)."""
+            # Shift targets right: <sos> + targets[:-1]
+            sos_token = 0  # Assuming 0 is <blank> or <sos>
+            shifted = torch.cat([
+                torch.full((targets.size(0), 1), sos_token, device=targets.device, dtype=targets.dtype),
+                targets[:, :-1]
+            ], dim=1)
+
+            # Embed and add positional encoding
+            dec_states = self.text_embed(shifted)
+            dec_states = self.dec_pos(dec_states)
+
+            # Create decoder padding mask
+            dec_mask = lengths_to_mask(target_lengths, shifted.size(1)).to(shifted.device)
+            dec_padding_mask = ~dec_mask.bool()
+            enc_padding_mask = ~enc_mask.bool()
+
+            # Pass through decoder layers
+            for layer in self.decoder_layers:
+                dec_states = layer(dec_states, enc_out, dec_padding_mask=dec_padding_mask, enc_padding_mask=enc_padding_mask)
+
+            dec_states = self.dec_norm(dec_states)
+            return dec_states
 
         def get_moe_modules(self) -> list[SharedAdapterMoEFFN]:
             modules: list[SharedAdapterMoEFFN] = []
@@ -1000,7 +1236,13 @@ if TORCH_IMPORT_ERROR is None:
                 ffn = getattr(block, "ffn", None)
                 if isinstance(ffn, SharedAdapterMoEFFN):
                     modules.append(ffn)
+            if self.use_decoder:
+                for layer in self.decoder_layers:
+                    ffn = getattr(layer, "ffn", None)
+                    if isinstance(ffn, SharedAdapterMoEFFN):
+                        modules.append(ffn)
             return modules
+
 
 
 else:
@@ -1013,7 +1255,7 @@ else:
     ConformerConvModule = None
     TransformerMoEBlock = None
     ConformerMoEBlock = None
-    EncoderMoECTCModel = None
+    HybridCTCModel = None
 
 
 def routing_regularizer(avg_gates: torch.Tensor | None, num_experts: int) -> torch.Tensor:
@@ -1074,7 +1316,7 @@ def compute_per_sample_ctc_losses(
 
 @torch.no_grad()
 def compute_expert_scores(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     batch: dict[str, Any],
     ctc_loss,
     args: argparse.Namespace,
@@ -1120,10 +1362,19 @@ def competition_targets(
     expert_scores: torch.Tensor,
     args: argparse.Namespace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    z = expert_scores.sum(dim=-1, keepdim=True).clamp_min(args.competition_epsilon)
-    q = expert_scores / z
-    fitness = q.sum(dim=0)
-    return q, fitness, z.squeeze(-1)
+    """Compute competition targets using natural niches algorithm.
+
+    Matches natural_niches_fn.py:
+        z = scores.sum(axis=0) ** alpha  # Total fitness per expert
+        fitness_matrix = scores / z[None, :]  # Normalize
+        fitness = fitness_matrix.sum(axis=0)  # Composite fitness per expert
+    """
+    alpha = float(getattr(args, "competition_alpha", 1.0))
+    # Sum over batch dimension (per expert), then apply alpha power
+    z = expert_scores.sum(dim=0).clamp_min(args.competition_epsilon) ** alpha  # (E,)
+    q = expert_scores / z[None, :]  # (B, E) normalized fitness matrix
+    fitness = q.sum(dim=0)  # (E,) composite fitness per expert
+    return q, fitness, z
 
 
 def routing_alignment_loss(
@@ -1142,7 +1393,17 @@ def routing_alignment_loss(
 def select_expert_parents(
     scores: torch.Tensor,
     eps: float = 1e-6,
+    alpha: float = 1.0,
+    use_matchmaker: bool = True,
 ) -> tuple[int, int, dict[str, Any]]:
+    """Select parent experts using natural niches competition algorithm.
+
+    Matches natural_niches_fn.py:
+    - Alpha normalization: z = scores.sum(axis=0) ** alpha
+    - Fitness matrix: q = scores / z
+    - Parent 1: chosen by fitness distribution
+    - Matchmaker: parent 2 chosen by difference from parent 1
+    """
     if scores.ndim != 2:
         raise ValueError(f"Expected scores with shape [B, E], got {tuple(scores.shape)}")
     num_experts = scores.size(1)
@@ -1151,25 +1412,40 @@ def select_expert_parents(
     if num_experts == 1:
         return 0, 0, {"fitness": [1.0], "attraction": [0.0]}
 
-    z = scores.sum(dim=-1, keepdim=True).clamp_min(eps)
-    q = scores / z
-    fitness = q.sum(dim=0)
-    parent_a = int(torch.argmax(fitness).item())
+    # Step 1: Alpha normalization (natural_niches_fn.py:13-15)
+    z = scores.sum(dim=0).clamp_min(eps) ** alpha  # (E,)
+    q = scores / z[None, :]  # (B, E) fitness matrix
+    fitness = q.sum(dim=0)  # (E,) composite fitness per expert
 
+    # Step 2: Select parent 1 by fitness distribution
+    probs = F.softmax(fitness, dim=0)
+    parent_a = int(torch.multinomial(probs, 1).item())
+
+    # Step 3: MATCHMAKER - select parent 2 by difference (competition)
     attraction = torch.zeros(num_experts, device=scores.device, dtype=scores.dtype)
-    denom = z.squeeze(-1) + eps
-    for candidate_idx in range(num_experts):
-        if candidate_idx == parent_a:
-            attraction[candidate_idx] = float("-inf")
-            continue
-        gains = torch.relu(scores[:, candidate_idx] - scores[:, parent_a]) / denom
-        attraction[candidate_idx] = gains.sum()
-
-    if torch.isfinite(attraction).any():
-        parent_b = int(torch.argmax(attraction).item())
+    if use_matchmaker:
+        # match_score: how different each candidate is from parent_a
+        match_score = torch.relu(q - q[parent_a, :][None, :]).sum(dim=1)
+        match_score[parent_a] = float("-inf")
+        if torch.isfinite(match_score).any():
+            parent_b = int(torch.argmax(match_score).item())
+        else:
+            sorted_fitness = torch.argsort(fitness, descending=True)
+            parent_b = int(sorted_fitness[1].item()) if len(sorted_fitness) > 1 else parent_a
     else:
-        sorted_fitness = torch.argsort(fitness, descending=True)
-        parent_b = int(sorted_fitness[1].item())
+        # Fallback: attraction-based selection (original method)
+        denom = scores.sum(dim=-1).clamp_min(eps)
+        for candidate_idx in range(num_experts):
+            if candidate_idx == parent_a:
+                attraction[candidate_idx] = float("-inf")
+                continue
+            gains = torch.relu(scores[:, candidate_idx] - scores[:, parent_a]) / denom
+            attraction[candidate_idx] = gains.sum()
+        if torch.isfinite(attraction).any():
+            parent_b = int(torch.argmax(attraction).item())
+        else:
+            sorted_fitness = torch.argsort(fitness, descending=True)
+            parent_b = int(sorted_fitness[1].item()) if len(sorted_fitness) > 1 else parent_a
 
     diagnostics = {
         "fitness": [round(float(v), 6) for v in fitness.detach().cpu().tolist()],
@@ -1177,13 +1453,15 @@ def select_expert_parents(
             round(float(v), 6) if math.isfinite(float(v)) else None
             for v in attraction.detach().cpu().tolist()
         ],
-        "mean_partition": round(float(z.mean().item()), 6),
+        "parent_a": parent_a,
+        "parent_b": parent_b,
+        "matchmaker": use_matchmaker,
     }
     return parent_a, parent_b, diagnostics
 
 
 def collect_moe_modules(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     block_limit: int,
 ) -> list[tuple[int, SharedAdapterMoEFFN]]:
     modules: list[tuple[int, SharedAdapterMoEFFN]] = []
@@ -1290,19 +1568,21 @@ def should_run_expert_evolution(args: argparse.Namespace, epoch: int) -> bool:
 
 @torch.no_grad()
 def compute_expert_diversity(moe_module: SharedAdapterMoEFFN) -> dict[str, float]:
-    """Compute pairwise cosine similarity between experts to detect collapse."""
+    """Compute pairwise cosine similarity between experts to detect collapse.
+
+    With the shared-trunk architecture, only the per-expert adapter
+    parameters are compared (shared trunk is identical for all experts).
+    """
     expert_vecs: list[torch.Tensor] = []
     for i in range(moe_module.num_experts):
         params: list[torch.Tensor] = []
-        for p in moe_module.trunks[i].parameters():
-            params.append(p.detach().reshape(-1))
-        for p in moe_module.share_down[i].parameters():
-            params.append(p.detach().reshape(-1))
+        # Only compare per-expert adapter weights (the unique part)
         for p in moe_module.adapter_up[i].parameters():
             params.append(p.detach().reshape(-1))
         for p in moe_module.adapter_down[i].parameters():
             params.append(p.detach().reshape(-1))
-        expert_vecs.append(torch.cat(params))
+        if params:
+            expert_vecs.append(torch.cat(params))
 
     if len(expert_vecs) < 2:
         return {"mean_cosine_sim": 0.0, "min_cosine_sim": 0.0, "max_cosine_sim": 0.0}
@@ -1351,7 +1631,7 @@ def build_lr_scheduler(optimizer, args: argparse.Namespace, steps_per_epoch: int
 
 @torch.no_grad()
 def evaluate(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     loader,
     tokenizer: CharTokenizer,
     ctc_loss,
@@ -1390,9 +1670,11 @@ def evaluate(
     for step, batch in enumerate(iterator, start=1):
         batch = move_batch_to_device(batch, device, non_blocking=device.startswith("cuda"))
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            log_probs, output_lengths, routing, _, _ = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            ctc_log_probs, output_lengths, routing, _, _, dec_log_probs = model(
+                batch["inputs"], batch["input_lengths"], return_aux=False
+            )
             per_sample_base_loss = compute_per_sample_ctc_losses(
-                log_probs,
+                ctc_log_probs,
                 batch["targets"],
                 output_lengths,
                 batch["target_lengths"],
@@ -1402,10 +1684,10 @@ def evaluate(
             lb_loss = (
                 routing_regularizer(routing, args.num_experts)
                 if routing is not None
-                else torch.tensor(0.0, device=log_probs.device)
+                else torch.tensor(0.0, device=ctc_log_probs.device)
             )
 
-        comp_loss = torch.tensor(0.0, device=log_probs.device)
+        comp_loss = torch.tensor(0.0, device=ctc_log_probs.device)
         if routing is not None and should_compute_competition_metrics(args, stage, step, epoch=epoch):
             expert_scores = compute_expert_scores(model, batch, ctc_loss, args, device, use_amp=False)
             if expert_scores is not None:
@@ -1413,7 +1695,9 @@ def evaluate(
                 comp_loss = routing_alignment_loss(routing, comp_targets, eps=args.competition_epsilon)
                 expert_fitness_storage.append(fitness.detach().cpu())
 
-        hypotheses = select_hypotheses(log_probs, output_lengths, tokenizer, args)
+        # Use CTC for CER/WER evaluation (or decoder if available)
+        eval_log_probs = dec_log_probs if dec_log_probs is not None else ctc_log_probs
+        hypotheses = select_hypotheses(eval_log_probs, output_lengths, tokenizer, args)
         batch_size = len(hypotheses)
         batch_shared_penalty = args.load_balance_weight * lb_loss.detach() + effective_comp_weight * comp_loss.detach()
         sample_total_loss = per_sample_base_loss.detach() + batch_shared_penalty
@@ -1493,7 +1777,7 @@ def evaluate(
 
 
 def train_one_epoch(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     loader,
     tokenizer: CharTokenizer,
     optimizer,
@@ -1513,6 +1797,7 @@ def train_one_epoch(
     accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
     running_loss = 0.0
     running_base_loss = 0.0
+    running_dec_loss = 0.0
     running_lb_loss = 0.0
     running_comp_loss = 0.0
     running_inter_ctc_loss = 0.0
@@ -1581,21 +1866,24 @@ def train_one_epoch(
 
         forward_start = time.perf_counter()
         with torch.autocast(device_type=autocast_device, dtype=autocast_dtype, enabled=use_amp):
-            log_probs, output_lengths, routing, _, inter_log_probs = model(batch["inputs"], batch["input_lengths"], return_aux=False)
+            ctc_log_probs, output_lengths, routing, _, inter_log_probs, dec_log_probs = model(
+                batch["inputs"], batch["input_lengths"],
+                targets=batch["targets"], target_lengths=batch["target_lengths"], return_aux=False
+            )
             raw_ctc_loss = ctc_loss(
-                log_probs.transpose(0, 1),
+                ctc_log_probs.transpose(0, 1),
                 batch["targets"],
                 output_lengths.cpu(),
                 batch["target_lengths"],
             )
             label_smooth_val = float(getattr(args, "label_smoothing", 0.0))
             if label_smooth_val > 0.0:
-                uniform_ent = -log_probs.mean()
+                uniform_ent = -ctc_log_probs.mean()
                 base_loss = (1.0 - label_smooth_val) * raw_ctc_loss + label_smooth_val * uniform_ent
             else:
                 base_loss = raw_ctc_loss
 
-            inter_ctc_loss = torch.tensor(0.0, device=log_probs.device)
+            inter_ctc_loss = torch.tensor(0.0, device=ctc_log_probs.device)
             inter_ctc_weight = float(getattr(args, "intermediate_ctc_weight", 0.0))
             if inter_ctc_weight > 0.0 and inter_log_probs is not None:
                 raw_inter_ctc = ctc_loss(
@@ -1610,10 +1898,22 @@ def train_one_epoch(
                 else:
                     inter_ctc_loss = raw_inter_ctc
 
+            # Decoder loss
+            dec_loss = torch.tensor(0.0, device=ctc_log_probs.device)
+            dec_weight = float(getattr(args, "decoder_loss_weight", 0.0))
+            if dec_log_probs is not None and dec_weight > 0.0:
+                # Shift targets for teacher forcing: <sos> + targets[:-1]
+                dec_targets = batch["targets"].clone()
+                dec_loss = F.cross_entropy(
+                    dec_log_probs.reshape(-1, dec_log_probs.size(-1)),
+                    dec_targets.reshape(-1),
+                    ignore_index=0,  # Assuming 0 is <blank> or <pad>
+                )
+
             lb_loss = (
                 routing_regularizer(routing, args.num_experts)
                 if routing is not None
-                else torch.tensor(0.0, device=log_probs.device)
+                else torch.tensor(0.0, device=ctc_log_probs.device)
             )
         synchronize_for_timing(device, profile_enabled)
         forward_time = time.perf_counter() - forward_start
@@ -1639,8 +1939,8 @@ def train_one_epoch(
             print(f"epoch={epoch} first batch competition done in {competition_time:.4f}s", flush=True)
 
         entropy_bonus_weight = float(getattr(args, "entropy_bonus_weight", 0.0))
-        routing_ent = routing_entropy(routing, eps=args.competition_epsilon) if routing is not None else torch.tensor(0.0, device=log_probs.device)
-        loss = base_loss + args.load_balance_weight * lb_loss + effective_comp_weight * comp_loss - entropy_bonus_weight * routing_ent + inter_ctc_weight * inter_ctc_loss
+        routing_ent = routing_entropy(routing, eps=args.competition_epsilon) if routing is not None else torch.tensor(0.0, device=ctc_log_probs.device)
+        loss = (1.0 - dec_weight) * base_loss + dec_weight * dec_loss + args.load_balance_weight * lb_loss + effective_comp_weight * comp_loss - entropy_bonus_weight * routing_ent + inter_ctc_weight * inter_ctc_loss
 
         scaled_loss = loss / accum_steps
         backward_start = time.perf_counter()
@@ -1686,6 +1986,7 @@ def train_one_epoch(
         running_total_weight += batch_size
         running_loss += float(loss.item()) * batch_size
         running_base_loss += float(base_loss.item()) * batch_size
+        running_dec_loss += float(dec_loss.item()) * batch_size
         running_lb_loss += float(lb_loss.item()) * batch_size
         running_comp_loss += float(comp_loss.item()) * batch_size
         running_inter_ctc_loss += float(inter_ctc_loss.item()) * batch_size
@@ -1707,6 +2008,7 @@ def train_one_epoch(
             print(
                 f"epoch={epoch} step={step}/{len(loader)} train_loss={avg_loss:.4f} "
                 f"ctc={running_base_loss / max(1, running_total_weight):.4f} "
+                f"dec={running_dec_loss / max(1, running_total_weight):.4f} "
                 f"lb={running_lb_loss / max(1, running_total_weight):.4f} "
                 f"comp={running_comp_loss / max(1, running_total_weight):.4f} "
                 f"inter_ctc={running_inter_ctc_loss / max(1, running_total_weight):.4f} "
@@ -1722,6 +2024,7 @@ def train_one_epoch(
                     "epoch": epoch,
                     "train/loss_step": avg_loss,
                     "train/base_loss_step": running_base_loss / max(1, running_total_weight),
+                    "train/dec_loss_step": running_dec_loss / max(1, running_total_weight),
                     "train/ctc_loss_step": running_base_loss / max(1, running_total_weight),
                     "train/load_balance_loss_step": running_lb_loss / max(1, running_total_weight),
                     "train/competition_loss_step": running_comp_loss / max(1, running_total_weight),
@@ -1763,6 +2066,7 @@ def train_one_epoch(
         "loss": running_loss / max(1, running_total_weight),
         "base_loss": running_base_loss / max(1, running_total_weight),
         "ctc_loss": running_base_loss / max(1, running_total_weight),
+        "dec_loss": running_dec_loss / max(1, running_total_weight),
         "load_balance_loss": running_lb_loss / max(1, running_total_weight),
         "competition_loss": running_comp_loss / max(1, running_total_weight),
         "inter_ctc_loss": running_inter_ctc_loss / max(1, running_total_weight),
@@ -1778,7 +2082,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def collect_evolution_statistics(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     loader,
     ctc_loss,
     args: argparse.Namespace,
@@ -1860,7 +2164,7 @@ def collect_evolution_statistics(
 
 @torch.no_grad()
 def evolve_experts(
-    model: EncoderMoECTCModel,
+    model: HybridCTCModel,
     loader,
     ctc_loss,
     args: argparse.Namespace,
@@ -1882,7 +2186,12 @@ def evolve_experts(
         fitness: torch.Tensor = stats["fitness"]
         avg_usage: torch.Tensor = stats["avg_usage"]
 
-        parent_a, parent_b, parent_diag = select_expert_parents(scores, eps=args.competition_epsilon)
+        parent_a, parent_b, parent_diag = select_expert_parents(
+            scores,
+            eps=args.competition_epsilon,
+            alpha=float(getattr(args, "competition_alpha", 1.0)),
+            use_matchmaker=bool(getattr(args, "competition_matchmaker", False)),
+        )
         replace_idx, replace_diag = select_replacement_expert(
             fitness,
             avg_usage,
@@ -1924,7 +2233,7 @@ def append_vector_metrics(payload: dict[str, float], prefix: str, values: list[f
 def main() -> None:
     args = parse_args()
 
-# Auto‑set number of experts when a pretrained encoder is specified
+# Autoâ€‘set number of experts when a pretrained encoder is specified
 if args.pretrained_encoder:
     expert_map = {
         "facebook/wav2vec2-base": 8,
@@ -2091,7 +2400,7 @@ if args.pretrained_encoder:
                 else None
             )
 
-        model = EncoderMoECTCModel(args, vocab_size=len(tokenizer.id_to_token)).to(device)
+        model = HybridCTCModel(args, vocab_size=len(tokenizer.id_to_token)).to(device)
         raw_model = model
         if n_gpus > 1:
             model = nn.DataParallel(model)
@@ -2414,3 +2723,6 @@ if args.pretrained_encoder:
 
 if __name__ == "__main__":
     main()
+
+
+

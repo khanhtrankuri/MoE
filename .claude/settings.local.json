@@ -3,7 +3,11 @@
     "allow": [
       "Bash(Get-Content \"C:\\\\Users\\\\Admin\\\\.claude\\\\debug\\\\8fd86c67-808f-49ee-ad46-e99446338992.txt\")",
       "Bash(Select-String -Pattern \"\\\\[ERROR\\\\]|\\\\[WARN\\\\]\")",
-      "Bash(Select-Object -First 50)"
+      "Bash(Select-Object -First 50)",
+      "Bash(python *)",
+      "mcp__openvision__analyze_image",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Admin\\\\Documents\\\\MoE\" -Filter \"*.py\")",
+      "Bash(Select-Object Name)"
     ]
   }
 }
