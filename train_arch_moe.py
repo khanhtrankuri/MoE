@@ -1923,6 +1923,20 @@ def append_vector_metrics(payload: dict[str, float], prefix: str, values: list[f
 
 def main() -> None:
     args = parse_args()
+
+# Auto‑set number of experts when a pretrained encoder is specified
+if args.pretrained_encoder:
+    expert_map = {
+        "facebook/wav2vec2-base": 8,
+        "facebook/wav2vec2-large": 12,
+        "openai/whisper-base": 6,
+        "openai/whisper-large": 10,
+        "facebook/hubert-base": 6,
+        "facebook/hubert-large": 12,
+        "facebook/xlsr-53": 16,
+        "facebook/xlsr-53-large": 20,
+    }
+    args.num_experts = expert_map.get(args.pretrained_encoder.lower(), args.num_experts)
     ensure_torch()
     set_seed(args.seed)
 
