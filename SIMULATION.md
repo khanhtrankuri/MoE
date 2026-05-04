@@ -140,32 +140,8 @@ python ./precompute_features.py `
 
 **With Indic cache:**
 ```bash
-python ./train_arch_moe.py `
-  --train-manifest ./cache_indic/train/manifest.jsonl `
-  --valid-manifest ./cache_indic/validation/manifest.jsonl `
-  --test-manifest ./cache_indic/test/manifest.jsonl `
-  --output-dir ./runs/ca_samoe_indic_cached `
-  --data-mode cached `
-  --encoder-type conformer `
-  --ffn-type shared_adapter_moe `
-  --num-experts 6 `
-  --epochs 50 `
-  --batch-size 12 `
-  --num-workers 4 `
-  --pin-memory on `
-  --persistent-workers on `
-  --prefetch-factor 4 `
-  --competition-weight 0.05 `
-  --competition-interval-steps 4 `
-  --competition-warmup-epochs 1 `
-  --competition-batches 1 `
-  --eval-every-epochs 1 `
-  --early-stop-patience 5 `
-  --amp on `
-  --profile-performance `
-  --log-timing-every 20 `
-  --max-audio-seconds 30 `
-  --wandb-run-name arch-casamoe-indic_telugu
+python train_arch_moe.py --train-manifest processed_data_librispeech/manifests/train.jsonl --valid-manifest processed_data_librispeech/manifests/validation.jsonl --test-manifest processed_data_librispeech/manifests/test.jsonl --output-dir runs/exp1 --encoder-type conformer --ffn-type shared_adapter_moe --num-experts 4 --epochs 15 --batch-size 4 --lr 3e-4 --device cuda:0 --max-tokens-per-batch 50000 --pretrained-encoder facebook/wav2vec2-base --wandb-mode disabled --allow-existing-output-dir
+
 ```
 
 **With merged cache:**
